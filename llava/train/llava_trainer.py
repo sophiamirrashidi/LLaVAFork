@@ -6,7 +6,6 @@ import torch.optim as optim
 from packaging import version
 import time
 import deepspeed
-import random
 import sys 
 import json
 import numpy as np
@@ -48,6 +47,11 @@ from transformers.trainer import (
 )
 
 from typing import List, Optional, Union
+import wandb 
+
+wandb.init(
+    project="llava_safety"
+)
 
 TRAINER_STATE_NAME = "trainer_state.json"
 lr = 0.0002
@@ -314,41 +318,7 @@ class LLaVATrainer(Trainer):
         else:
             super(LLaVATrainer, self)._save(output_dir, state_dict)
 
-    # def _maybe_log_save_evaluate(self, tr_loss, disc_loss, summed_loss, model, trial, epoch, ignore_keys_for_eval):
-    #     if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
-    #         if is_torch_tpu_available():
-    #             xm.mark_step()
-
-    #         logs: Dict[str, float] = {}
-            
-    #     if isinstance(disc_loss, np.ndarray):
-    #         disc_loss = torch.tensor(disc_loss)
-    #     if isinstance(summed_loss, np.ndarray):
-    #         summed_loss = torch.tensor(summed_loss)
-            
-    #         # all_gather + mean() to get average loss over all processes
-    #         tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
-    #         disc_loss_scalar = self._nested_gather(disc_loss).mean().item()
-    #         summed_loss_scalar = self._nested_gather(summed_loss).mean().item()
-    #         gen_loss_scalar = self._nested_gather((summed_loss - disc_loss)).mean().item()
-
-    #         # reset tr_loss to zero
-    #         tr_loss -= tr_loss
-    #         disc_loss -= disc_loss
-    #         summed_loss -= summed_loss
-
-    #         logs["loss"] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
-    #         logs["disc_loss"] = round(disc_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
-    #         logs["summmed_loss"] = round(summed_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
-    #         logs["gen_loss"] = round(gen_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
-    #         logs["learning_rate"] = self._get_learning_rate()
-
-    #         self._total_loss_scalar += tr_loss_scalar
-    #         self._globalstep_last_logged = self.state.global_step
-    #         self.store_flos()
-
-    #         self.log(logs)
-
+    
     def _inner_training_loop(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
     ):
@@ -641,8 +611,7 @@ class LLaVATrainer(Trainer):
                 rng_to_sync = True
 
             step = -1
-            for step, inputs in enumerate(epoch_iterator): 
-                inputs["d_mode"] = True if step % 3 == 0 else False
+            for step, inputs in enumerate(epoch_iterator):
                 total_batched_samples += 1
 
                 if self.args.include_num_input_tokens_seen:
@@ -675,12 +644,7 @@ class LLaVATrainer(Trainer):
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
                 with self.accelerator.accumulate(model):
-                    tr_loss_step = self.training_step(model, inputs)
-
-                # if inputs['d_mode'] == True:
-                #     disc_loss = tr_loss_step
-                # else:
-                #     summed_loss = tr_loss_step
+                    tr_loss_step = self.training_step_handler(model, inputs)
 
                 if (
                     args.logging_nan_inf_filter
@@ -728,13 +692,8 @@ class LLaVATrainer(Trainer):
                             )
 
                     # Optimizer step
-                    
-                    if inputs["d_mode"] == True:
-                        self.d_optimizer.step()
-                        model.module.base_model.model.discriminator.zero_grad() 
-
-                    else:
-                         self.optimizer.step()
+                    self.optimizer.step()
+                    self.d_optimizer.step()
 
                     optimizer_was_run = not self.accelerator.optimizer_step_was_skipped
                     if optimizer_was_run:
@@ -747,24 +706,10 @@ class LLaVATrainer(Trainer):
                     self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
-                    if abs(self.state.epoch - 0.25) < 1e-4:
-                        print(f"Saving checkpoint at epoch {self.state.epoch}")
-                        self._save_checkpoint(model, trial=None) # only saves the mm_projector weights, which can be passed into the model later
-
-                    elif abs(self.state.epoch - 0.5) < 1e-4:
-                        print(f"Saving checkpoint at epoch {self.state.epoch}")
-                        self._save_checkpoint(model, trial=None)
-
-                    elif abs(self.state.epoch - 0.75) < 1e-4:
-                        print(f"Saving checkpoint at epoch {self.state.epoch}")
-                        self._save_checkpoint(model, trial=None) 
-
                     self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
             # self._maybe_log_save_evaluate(tr_loss, disc_loss, summed_loss, model, trial, epoch, ignore_keys_for_eval)
                 else:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
-
-                torch.cuda.empty_cache() 
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
@@ -850,3 +795,86 @@ class LLaVATrainer(Trainer):
             self._deactivate_neftune(self.model)
 
         return TrainOutput(self.state.global_step, train_loss, metrics)
+    
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], dmode: bool = False) -> torch.Tensor:
+
+        inputs['d_mode'] = dmode
+
+        if not dmode: 
+            for name, param in model.named_parameters(): 
+                if "discriminator" in name: 
+                    param.requires_grad = False
+                if "mm_projector" in name: 
+                    param.requires_grad = True
+        
+        if dmode: 
+            for name, param in model.named_parameters(): 
+                if "mm_projector" in name: 
+                    param.requires_grad = False
+            for name, param in model.named_parameters(): 
+                if "discriminator" in name: 
+                    param.requires_grad = True
+
+        model.train()
+        inputs = self._prepare_inputs(inputs) 
+
+        if is_sagemaker_mp_enabled():
+            loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
+            return loss_mb.reduce_mean().detach().to(self.args.device)
+
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+        if self.use_apex:
+            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            self.accelerator.backward(loss)
+        
+        if dmode: 
+            wandb.log({"discriminator_loss": loss})
+
+        return loss.detach() / self.args.gradient_accumulation_steps
+
+    def training_step_handler(self, model, inputs): 
+        return self.training_step(model, inputs, True) + self.training_step(model, inputs, False) 
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+
+        Subclass and override for custom behavior.
+        """
+        if self.label_smoother is not None and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+        outputs = model(**inputs)
+        # Save past state if it exists
+        # TODO: this needs to be fixed and made cleaner later.
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        if labels is not None:
+            unwrapped_model = unwrap_model(model)
+            if _is_peft_model(unwrapped_model):
+                model_name = unwrapped_model.base_model.model._get_name()
+            else:
+                model_name = unwrapped_model._get_name()
+            if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+                loss = self.label_smoother(outputs, labels, shift_labels=True)
+            else:
+                loss = self.label_smoother(outputs, labels)
+        else:
+            if isinstance(outputs, dict) and "loss" not in outputs:
+                raise ValueError(
+                    "The model did not return a loss from the inputs, only the following keys: "
+                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+                )
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        return (loss, outputs) if return_outputs else loss
