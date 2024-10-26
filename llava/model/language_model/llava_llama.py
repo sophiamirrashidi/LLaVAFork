@@ -65,6 +65,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         }
 
         self.discriminator = Discriminator(5120)  # hard coding in sizes for now
+        self.initialize_deep_mm_projector()
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -81,6 +82,34 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             json.dump(data, f)
             f.write('\n') 
 
+    def initialize_deep_mm_projector(self):
+        hidden_size = 5120
+        dropout_rate = 0.3
+        self.deep_mm_projector = nn.Sequential(
+        nn.Linear(hidden_size, hidden_size),  # First layer increasing dimensionality
+        nn.GELU(),
+        nn.Dropout(p=dropout_rate),  # Dropout after activation
+        
+        nn.Linear(hidden_size, hidden_size),  # Intermediate layer
+        nn.GELU(),
+        nn.Dropout(p=dropout_rate),
+        
+        nn.Linear(hidden_size, hidden_size),  # Return to original size
+        nn.GELU(),
+        nn.Dropout(p=dropout_rate),
+        
+        nn.Linear(hidden_size, hidden_size),  # Return to original size
+        nn.GELU(),
+        nn.Dropout(p=dropout_rate),
+        
+        nn.Linear(hidden_size, hidden_size),  # Return to original size
+        nn.GELU(),
+        nn.Dropout(p=dropout_rate),
+        
+        nn.Linear(hidden_size, hidden_size),  # Final layer
+        nn.GELU()
+    )
+    
     def forward(
         self,
         input_ids: torch.LongTensor = None,

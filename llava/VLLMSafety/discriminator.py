@@ -10,7 +10,7 @@ import random
 class Discriminator(nn.Module):
     def __init__(self, input_size, learning_rate=0.0002, adam_beta1=0.9):
         super().__init__()
-
+        self.dropout = nn.Dropout(0.3)
         self.fc1 = nn.Linear(input_size, 50)
         self.fc2 = nn.Linear(50, 1)
 
@@ -20,9 +20,14 @@ class Discriminator(nn.Module):
 
     def linear(self, x):
         x = F.relu(self.fc1(x))
+        x = self.dropout(x)
         x = torch.sigmoid(self.fc2(x))
 
         return x
+    
+    def add_noise(self, input_tensor, noise_level=0.05):
+        noise = noise_level * torch.randn_like(input_tensor)
+        return input_tensor + noise
 
     def run_forward(self, data, d_mode):
 
@@ -37,6 +42,8 @@ class Discriminator(nn.Module):
         for image, language in zipped_lists:
             # can add some logic to balance the dataset? usually lang tokens are less than image
             if d_mode:
+                image = self.add_noise(image)
+                language = self.add_noise(language)
                 loss, img, lang = self.forward(
                     image.view(-1, 5120), language.view(-1, 5120), d_mode
                 )
@@ -92,7 +99,7 @@ class Discriminator(nn.Module):
 
         else:
             lang_label = torch.full(
-                (img_tok.size(0), 1), 0, dtype=torch.bfloat16, device=self.device
+                (img_tok.size(0), 1), 0.1, dtype=torch.bfloat16, device=self.device
             )  #  0 for lang
             img_with_lang_label_loss = loss_function(
                 img_pred, lang_label
