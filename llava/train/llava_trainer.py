@@ -318,7 +318,37 @@ class LLaVATrainer(Trainer):
         else:
             super(LLaVATrainer, self)._save(output_dir, state_dict)
 
-    
+    def _maybe_log_save_evaluate(self, tr_loss, disc_loss, summed_loss, gen_loss, disc_acc, model, trial, epoch, ignore_keys_for_eval):
+        if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
+            if is_torch_tpu_available():
+                xm.mark_step()
+
+            logs: Dict[str, float] = {}
+            
+            # all_gather + mean() to get average loss over all processes
+            tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
+            disc_loss_scalar = disc_loss if disc_loss is not None else 0.0
+            summed_loss_scalar = summed_loss if summed_loss is not None else 0.0
+            gen_loss_scalar = gen_loss if gen_loss is not None else 0.0
+
+
+            # reset tr_loss to zero
+            tr_loss -= tr_loss
+
+            logs["loss"] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
+            logs["disc_loss"] = round(disc_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
+            logs["summed_loss"] = round(summed_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
+            logs["gen_loss"] = round(gen_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
+            logs["disc_acc"] = round(disc_acc / (self.state.global_step - self._globalstep_last_logged), 4)
+            logs["learning_rate"] = self._get_learning_rate()
+
+            self._total_loss_scalar += tr_loss_scalar
+            self._globalstep_last_logged = self.state.global_step
+            self.store_flos()
+
+            self.log(logs)
+
+
     def _inner_training_loop(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
     ):

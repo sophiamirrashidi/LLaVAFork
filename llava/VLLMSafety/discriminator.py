@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 import json
 import random
+import wandb
 
 
 class Discriminator(nn.Module):
@@ -87,6 +88,12 @@ class Discriminator(nn.Module):
 
             img_is_correct = torch.eq(img_pred_binary, img_label)
             lang_is_correct = torch.eq(lang_pred_binary, lang_label)
+
+            img_total = img_is_correct.size(0)
+            lang_total = lang_is_correct.size(0)
+
+            accuracy = (img_is_correct.sum().item() + lang_is_correct.sum().item()) / (img_total + lang_total)
+            wandb.log(accuracy)
 
             return loss, img_is_correct, lang_is_correct
 

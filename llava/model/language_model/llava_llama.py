@@ -71,15 +71,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
     def get_model(self):
         return self.model
-    
-    def log_data_to_json(self, data, date='10-10', directory="output_logs"):
-        filename = "loss_" + date + ".json"
-        os.makedirs(directory, exist_ok=True)
-        filepath = os.path.join(directory, filename)
-        
-        with open(filepath, 'a') as f:
-            json.dump(data, f)
-            f.write('\n') 
 
     def forward(
         self,
@@ -134,9 +125,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             )
 
             d_loss = discrim_dict["loss"]
-
-            data = {"disc loss": d_loss.item()}
-            self.log_data_to_json(data, date='10-10-d_mode')
+            wandb.log({"disc_loss: ": d_loss})
 
             model_output.loss = 0 * model_output.loss + d_loss  # returning only discriminator loss
 
@@ -159,9 +148,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             )
 
 
-            wandb.log({"generator_loss": model_output.loss})
-            wandb.log({"generator_disc_loss: ": d_loss})
-            model_output.loss = 1.5 * model_output.loss + d_loss
+            wandb.log({"generator_loss": model_output.loss - d_loss})
+            wandb.log({"summed_loss": model_output.loss})
+            wandb.log({"disc_loss: ": d_loss})
+            model_output.loss = model_output.loss + d_loss
                 
         return model_output
 
