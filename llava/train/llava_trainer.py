@@ -54,7 +54,7 @@ wandb.init(
 )
 
 TRAINER_STATE_NAME = "trainer_state.json"
-lr = 0.0002
+lr = 0.001
 beta1 = 0.5
   
 

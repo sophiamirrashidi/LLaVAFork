@@ -64,7 +64,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             "lang": None,
         }
 
-        self.discriminator = Discriminator(5120)  # hard coding in sizes for now
+        self.eval_mode = False
+
+        if not self.eval_mode:
+            self.discriminator = Discriminator(5120)  # hard coding in sizes for now
         self.initialize_deep_mm_projector()
 
         # Initialize weights and apply final processing
@@ -143,6 +146,20 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 labels,
                 images,
                 image_sizes,
+            )
+
+        if self.eval_mode: 
+            return super().forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
             )
 
         if d_mode == True:
