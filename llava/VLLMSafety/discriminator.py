@@ -15,9 +15,9 @@ class Discriminator(nn.Module):
         self.fc1 = nn.Linear(input_size, 50)
         self.fc2 = nn.Linear(50, 1)
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.to(self.device)
+        # self.to(self.device)
 
     def linear(self, x):
         x = F.relu(self.fc1(x))
@@ -70,12 +70,16 @@ class Discriminator(nn.Module):
 
         if d_mode == True:
 
-            img_label = torch.full(
-                (img_tok.size(0), 1), 1, dtype=torch.bfloat16, device=self.device
-            )  # 1 for images
-            lang_label = torch.full(
-                (lang_tok.size(0), 1), 0, dtype=torch.bfloat16, device=self.device
-            )  #  0 for lang
+            # img_label = torch.full(
+            #     (img_tok.size(0), 1), 1, dtype=torch.bfloat16, device=self.device
+            # )  # 1 for images
+            # lang_label = torch.full(
+            #     (lang_tok.size(0), 1), 0, dtype=torch.bfloat16, device=self.device
+            # )  #  0 for lang
+
+
+            img_label = torch.full((img_tok.size(0), 1), 1, dtype=torch.bfloat16, device=img_pred.device)  # 1 for images
+            lang_label = torch.full((lang_tok.size(0), 1), 0, dtype=torch.bfloat16, device=lang_pred.device)  # 0 for lang
 
             img_loss = loss_function(img_pred, img_label)
             lang_loss = loss_function(lang_pred, lang_label)
@@ -93,16 +97,14 @@ class Discriminator(nn.Module):
             lang_total = lang_is_correct.size(0)
 
             accuracy = (img_is_correct.sum().item() + lang_is_correct.sum().item()) / (img_total + lang_total)
-            wandb.log(accuracy)
+            wandb.log({'disc_acc': accuracy})
 
             return loss, img_is_correct, lang_is_correct
 
         else:
-            lang_label = torch.full(
-                (img_tok.size(0), 1), 0, dtype=torch.bfloat16, device=self.device
-            )  #  0 for lang
-            img_with_lang_label_loss = loss_function(
-                img_pred, lang_label
-            )  # trying to follow DCGAN
+            # lang_label = torch.full((img_tok.size(0), 1), 0, dtype=torch.bfloat16, device = self.device)  #  0 for lang
+            lang_label = torch.full((img_tok.size(0), 1), 0, dtype=torch.bfloat16, device = img_pred.device)  #  0 for lang
+
+            img_with_lang_label_loss = loss_function(img_pred, lang_label)  # trying to follow DCGAN
 
             return img_with_lang_label_loss  # returning image loss to maximize disc loss when training generator
