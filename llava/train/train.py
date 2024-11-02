@@ -37,6 +37,8 @@ from llava.mm_utils import tokenizer_image_token
 
 from PIL import Image
 
+import torch.distributed as dist
+
 
 local_rank = None
 
@@ -787,6 +789,7 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
 
 def train(attn_implementation=None):
     global local_rank
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
     print("Starting Training")
 
     parser = transformers.HfArgumentParser(

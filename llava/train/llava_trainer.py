@@ -799,19 +799,19 @@ class LLaVATrainer(Trainer):
 
         inputs['d_mode'] = dmode
 
-        if not dmode: 
-            for name, param in model.named_parameters(): 
-                if "discriminator" in name: 
-                    param.requires_grad = False
-                if "mm_projector" in name: 
+        if dmode:
+            # Enable gradients only for the discriminator, disable for all else
+            for name, param in model.named_parameters():
+                if "discriminator" in name:
                     param.requires_grad = True
-        
-        if dmode: 
-            for name, param in model.named_parameters(): 
-                if "mm_projector" in name: 
+                else:
                     param.requires_grad = False
-            for name, param in model.named_parameters(): 
-                if "discriminator" in name: 
+        else:
+            # Enable gradients only for main model and mm_projector; keep vision_tower frozen and freeze discriminator
+            for name, param in model.named_parameters():
+                if "vision_tower" in name or "discriminator" in name:
+                    param.requires_grad = False
+                else:
                     param.requires_grad = True
 
         model.train()
@@ -839,6 +839,7 @@ class LLaVATrainer(Trainer):
         return loss.detach() / self.args.gradient_accumulation_steps
 
     def training_step_handler(self, model, inputs): 
+        # return self.training_step(model, inputs, False) 
         return self.training_step(model, inputs, True) + self.training_step(model, inputs, False) 
 
     def compute_loss(self, model, inputs, return_outputs=False):
