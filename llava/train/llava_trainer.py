@@ -839,7 +839,6 @@ class LLaVATrainer(Trainer):
         return loss.detach() / self.args.gradient_accumulation_steps
 
     def training_step_handler(self, model, inputs): 
-        # return self.training_step(model, inputs, False) 
         return self.training_step(model, inputs, True) + self.training_step(model, inputs, False) 
 
     def compute_loss(self, model, inputs, return_outputs=False):
