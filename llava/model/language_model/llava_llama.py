@@ -58,6 +58,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         }
         
         self.eval_mode = False
+        self.initialize_deep_mm_projector()
 
         if not self.eval_mode: 
             self.discriminator = Discriminator(5120) # hard coding in sizes for now
@@ -65,6 +66,55 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def initialize_deep_mm_projector(self, device=None):
+        hidden_size = 5120
+        #dropout_prob = 0.2  
+        # Dropout layers are excluded in evaluation mode
+        self.deep_mm_projector = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU()
+        )
+        # else:
+        #     # Dropout layers are included in training mode
+        #     self.deep_mm_projector = nn.Sequential(
+        #         nn.Linear(hidden_size, hidden_size),
+        #         nn.GELU(),
+        #         nn.Dropout(dropout_prob),
+
+        #         nn.Linear(hidden_size, hidden_size),
+        #         nn.GELU(),
+        #         nn.Dropout(dropout_prob),
+
+        #         nn.Linear(hidden_size, hidden_size),
+        #         nn.GELU(),
+        #         nn.Dropout(dropout_prob),
+
+        #         nn.Linear(hidden_size, hidden_size),
+        #         nn.GELU(),
+        #         nn.Dropout(dropout_prob),
+
+        #         nn.Linear(hidden_size, hidden_size),
+        #         nn.GELU(),
+        #         nn.Dropout(dropout_prob),
+
+        #         nn.Linear(hidden_size, hidden_size),
+        #         nn.GELU()
+        #     )
 
     def get_model(self):
         return self.model
@@ -140,7 +190,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             #     json.dump(data, f)
             #     f.write('\n')
                         
-            model_output.loss = d_loss # returning only discriminator loss
+            model_output.loss = 0 * model_output.loss + d_loss # returning only discriminator loss
+            wandb.log({"discriminator_loss": model_output.loss})
 
             return model_output
         else:
@@ -160,6 +211,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             
             model_output.loss = model_output.loss + d_loss # returning sum of model and discriminator loss
             wandb.log({"generator_disc loss": d_loss})
+            wandb.log({"generator loss": model_output.loss - d_loss})
 
             data = {'model loss': model_output.loss.item()}
             # with open('/home/smirrashidi/loss_9-24.json', 'a') as f:
@@ -168,6 +220,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
         return model_output
     
+    @torch.no_grad()
     def forward_eval_discrim(
         self,
         input_ids: torch.LongTensor = None,
