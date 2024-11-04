@@ -789,8 +789,14 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
 
 def train(attn_implementation=None):
     global local_rank
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
+    # os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
     print("Starting Training")
+
+    rank = int(os.environ.get('RANK', -1))
+    local_rank = int(os.environ.get('LOCAL_RANK', -1))
+
+    torch.cuda.set_device(local_rank)
+    print(f"Rank {rank} is using local rank {local_rank} on device {torch.cuda.current_device()}")
 
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
@@ -965,7 +971,8 @@ def train(attn_implementation=None):
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
 
-    model.to("cuda")
+    # model.to("cuda")
+    model.to(torch.device(f'cuda:{local_rank}'))
     
     for name, param in model.discriminator.named_parameters():
         param.requires_grad = True

@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import wandb
+import os
 
 class Discriminator(nn.Module):
     def __init__(self, input_size):
@@ -14,10 +16,14 @@ class Discriminator(nn.Module):
         return x
 
     def run_forward(self, data, d_mode):
-        device = data['image'][0].device
+        # device = data['image'][0].device
+        rank = int(os.environ.get('RANK', -1))
+        local_rank = int(os.environ.get('LOCAL_RANK', -1))
 
-        data['lang'] = [lang.to(device) for lang in data['lang']]
-        image_list = [img.to(device) for img in data['image']]
+        torch.cuda.set_device(local_rank)
+
+        data['lang'] = [lang for lang in data['lang']]
+        image_list = [img  for img in data['image']]
 
         zipped_lists = list(zip(image_list, data["lang"]))
 
@@ -27,16 +33,15 @@ class Discriminator(nn.Module):
 
         for image, language in zipped_lists:
             if d_mode:
-                loss, img, lang = self.forward(
-                    image.view(-1, 5120), language.view(-1, 5120), d_mode, device
-                )
+                loss, img, lang = self.forward(image.view(-1, 5120), language.view(-1, 5120), d_mode, device= torch.device(f'cuda:{local_rank}'))
+                # loss, img, lang = self.forward(image.view(-1, 5120), language.view(-1, 5120), d_mode)
                 total_loss += loss / len(zipped_lists)
                 img_is_correct += torch.sum(img)
                 lang_is_correct += torch.sum(lang)
             else:
-                total_loss += self.forward(
-                    image.view(-1, 5120), language.view(-1, 5120), d_mode, device
-                ) / len(zipped_lists)
+                total_loss += self.forward(image.view(-1, 5120), language.view(-1, 5120), d_mode, device= torch.device(f'cuda:{local_rank}')) / len(zipped_lists)
+                # total_loss += self.forward(image.view(-1, 5120), language.view(-1, 5120), d_mode) / len(zipped_lists)
+
 
         print("dmode: ", d_mode, "image is correct: ", img_is_correct)
         print("dmode: ", d_mode, "lang is correct: ", lang_is_correct)
@@ -75,6 +80,8 @@ class Discriminator(nn.Module):
 
             img_is_correct = torch.eq(img_pred_binary, img_label).to(device)
             lang_is_correct = torch.eq(lang_pred_binary, lang_label).to(device)
+            # img_is_correct = torch.eq(img_pred_binary, img_label)
+            # lang_is_correct = torch.eq(lang_pred_binary, lang_label)
 
             img_total = img_is_correct.size(0)
             lang_total = lang_is_correct.size(0)
@@ -84,8 +91,10 @@ class Discriminator(nn.Module):
 
             return loss, img_is_correct, lang_is_correct
         else:
-            lang_label = torch.full(
-                (img_tok.size(0), 1), 0, dtype=torch.bfloat16, device=device
-            )
+            lang_label = torch.full((img_tok.size(0), 1), 0, dtype=torch.bfloat16, device=device)
+            lang_label = torch.full((img_tok.size(0), 1), 0, dtype=torch.bfloat16, device=device)
+            # lang_label = torch.full(
+            #     (img_tok.size(0), 1), 0, dtype=torch.bfloat16, device=torch.device(f'cuda:{local_rank}')
+            # )
             img_with_lang_label_loss = loss_function(img_pred, lang_label)
             return img_with_lang_label_loss

@@ -798,6 +798,10 @@ class LLaVATrainer(Trainer):
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], dmode: bool = False) -> torch.Tensor:
 
         inputs['d_mode'] = dmode
+        rank = int(os.environ.get('RANK', -1))
+        local_rank = int(os.environ.get('LOCAL_RANK', -1))
+
+        torch.cuda.set_device(local_rank)
 
         if dmode:
             # Enable gradients only for the discriminator, disable for all else
