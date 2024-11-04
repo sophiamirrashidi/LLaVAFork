@@ -50,13 +50,11 @@ from typing import List, Optional, Union
 import wandb
 
 TRAINER_STATE_NAME = "trainer_state.json"
-lr = 0.0002
+lr = 0.001
 beta1 = 0.5
 
 #os.environ['WANDB_MODE'] = 'disabled'
-wandb.init(
-    project="llava_safety"
-)
+wandb.init(project="llava_safety")
 
 def maybe_zero_3(param, ignore_status=False, name=None):
     from deepspeed import zero
@@ -222,16 +220,10 @@ class LLaVATrainer(Trainer):
             decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
             if self.args.mm_projector_lr is not None:
-                projector_parameters = [name for name, _ in opt_model.named_parameters() if "mm_projector" in name]
-                discriminator_parameters = [name for name, _ in opt_model.named_parameters() if "discriminator" in name]
+                projector_parameters = [name for name, _ in opt_model.named_parameters() if "mm_projector" in name and not "deep" in name]
+                deep_proj_parameters = [name for name, _ in opt_model.named_parameters() if "deep_mm_projector" in name]
+                #discriminator_parameters = [name for name, _ in opt_model.named_parameters() if "discriminator" in name]
                 optimizer_grouped_parameters = [
-                    {
-                        "params": [
-                            p for n, p in opt_model.named_parameters() if (n in discriminator_parameters and p.requires_grad)
-                        ],
-                        "weight_decay": 0, # TODO: this can be a hyperparameter
-                        "lr": lr,
-                    },
                     {
                         "params": [
                             p for n, p in opt_model.named_parameters() if (n in decay_parameters and n in projector_parameters and p.requires_grad)
@@ -245,6 +237,13 @@ class LLaVATrainer(Trainer):
                         ],
                         "weight_decay": 0.0,
                         "lr": self.args.mm_projector_lr,
+                    },
+                    {
+                        "params": [
+                            p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n in deep_proj_parameters)
+                        ],
+                        "weight_decay": 0.0,
+                        "lr": 2e-3,
                     },
                 ]
             else: # our code will never go here
@@ -609,7 +608,6 @@ class LLaVATrainer(Trainer):
 
             step = -1
             for step, inputs in enumerate(epoch_iterator): 
-                inputs["d_mode"] = True if step % 2 == 0 else False
                 total_batched_samples += 1
 
                 if self.args.include_num_input_tokens_seen:
@@ -642,7 +640,7 @@ class LLaVATrainer(Trainer):
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
                 with self.accelerator.accumulate(model):
-                    tr_loss_step = self.training_step(model, inputs)
+                    tr_loss_step = self.training_step(model, inputs, step)
 
                 if (
                     args.logging_nan_inf_filter
@@ -690,13 +688,7 @@ class LLaVATrainer(Trainer):
                             )
 
                     # Optimizer step
-                    
-                    if inputs["d_mode"] == True:
-                        self.d_optimizer.step()
-                        model.module.base_model.model.discriminator.zero_grad() 
-
-                    else:
-                         self.optimizer.step()
+                    self.optimizer.step()
 
                     optimizer_was_run = not self.accelerator.optimizer_step_was_skipped
                     if optimizer_was_run:
@@ -817,23 +809,53 @@ class LLaVATrainer(Trainer):
 
         return TrainOutput(self.state.global_step, train_loss, metrics)
     
-    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+    def discriminator_on(self, model): 
+        for name, param in model.named_parameters(): 
+            if "discriminator" in name: 
+                param.requires_grad = True
+    
+    def discriminator_off(self, model): 
+        for name, param in model.named_parameters():
+            if "discriminator" in name: 
+                param.requires_grad = False
+
+    def projector_on(self, model): 
+        for name, param in model.named_parameters(): 
+            if "mm_projector" in name: 
+                param.requires_grad = True
+    
+    def projector_off(self, model): 
+        for name, param in model.named_parameters():
+            if "mm_projector" in name: 
+                param.requires_grad = False
+    
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], step: int) -> torch.Tensor:
         """
         gan style, compute d_loss and g_loss and update optimizers accordingly
         """
+        discriminator_params = [p for n, p in model.named_parameters() if "discriminator" in n]
         model.train()
         inputs = self._prepare_inputs(inputs)
 
-        # get d loss
-        d_loss = self._compute_loss_for_discriminator(model, inputs)
-        self._backward_pass(d_loss, self.d_optimizer, update_optimizer=True, loss_name="discriminator_loss")
+        d_loss = None
+        if step > 200: # for the first 200 steps only train the discriminator
+            # get d loss
+            self.discriminator_on(model)
+            #self.projector_off(model)
+            d_loss = self._compute_loss_for_discriminator(model, inputs)
+            self._backward_pass(d_loss, self.d_optimizer, update_optimizer=True, loss_name="discriminator_loss", discriminator_params=discriminator_params)
 
+        self.discriminator_off(model)
+        #self.projector_on(model)
         # get g loss
         g_loss = self._compute_loss_for_generator(model, inputs)
         self._backward_pass(g_loss, self.optimizer, update_optimizer=False, loss_name="generator_loss")
 
-
-        total_loss = d_loss.detach() + g_loss.detach()
+        if d_loss:
+            total_loss = g_loss.detach() - d_loss.detach()
+        else: 
+            total_loss = g_loss.detach()
+            
         return total_loss / self.args.gradient_accumulation_steps
 
     def _compute_loss_for_discriminator(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
@@ -856,7 +878,7 @@ class LLaVATrainer(Trainer):
 
         return g_loss
 
-    def _backward_pass(self, loss: torch.Tensor, optimizer, update_optimizer: bool, loss_name: str):
+    def _backward_pass(self, loss: torch.Tensor, optimizer, update_optimizer: bool, loss_name: str, discriminator_params=None):
         
         if self.use_apex:
             with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -864,10 +886,9 @@ class LLaVATrainer(Trainer):
         else:
             self.accelerator.backward(loss)  # backwards pass
 
-        # only update d_optimizer (we want g_optimizer to go through grad clips)
+        # only update d_optimizer (we want g_optimizer to go through grad clips) # discriminator_params should be passed
         if update_optimizer:
             optimizer.step()
             optimizer.zero_grad()
 
-        # Log the loss using WandB
-        wandb.log({loss_name: loss.item()})
+        # wandb.log({loss_name: loss.item()})

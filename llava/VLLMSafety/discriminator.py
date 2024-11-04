@@ -23,6 +23,8 @@ class Discriminator(nn.Module):
     
     def forward(self, data, d_mode):
 
+        self.train()
+
         device = 'cuda'  
         loss_function = nn.BCELoss()  # follow DCgan
 
@@ -34,15 +36,15 @@ class Discriminator(nn.Module):
         if not d_mode: 
             self.eval()
             lang_label = torch.full(
-                 (img_tok.size(0), 1), 0.2, dtype=torch.bfloat16, device=device
-             )  #  0 for lang (0.2 for label smoothing)
+                 (img_tok.size(0), 1), 0, dtype=torch.bfloat16, device=device
+             )  #  0 for lang (0 for label smoothing)
             img_with_lang_label_loss = loss_function(
                  img_pred, lang_label
             )  # trying to follow DCGAN
             self.train()
             return img_with_lang_label_loss
         
-        img_label = torch.full((img_tok.size(0), 1), 0.8, dtype=torch.bfloat16, device=device)  # Smoothing for images
+        img_label = torch.full((img_tok.size(0), 1), 1, dtype=torch.bfloat16, device=device)  # Smoothing for images
         img_loss = loss_function(img_pred, img_label)
 
         total_lang_loss = 0
@@ -54,7 +56,7 @@ class Discriminator(nn.Module):
         for lang_tensor in data["lang"]:
             lang_tensor = lang_tensor.to(device)
             lang_pred = self.linear(lang_tensor.view(-1, 5120))  # Process each lang tensor independently
-            lang_label = torch.full((lang_pred.size(0), 1), 0.2, dtype=torch.bfloat16, device=device)  # Smoothing for language
+            lang_label = torch.full((lang_pred.size(0), 1), 0, dtype=torch.bfloat16, device=device)  # Smoothing for language
 
             lang_loss = loss_function(lang_pred, lang_label)
             total_lang_loss += lang_loss

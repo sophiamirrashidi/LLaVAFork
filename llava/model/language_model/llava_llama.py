@@ -209,7 +209,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 return_dict=return_dict
             )
             
-            model_output.loss = model_output.loss + d_loss # returning sum of model and discriminator loss
+            model_output.loss = 2 * model_output.loss + d_loss # returning sum of model and discriminator loss
             wandb.log({"generator_disc loss": d_loss})
             wandb.log({"generator loss": model_output.loss - d_loss})
 
