@@ -808,8 +808,8 @@ class LLaVATrainer(Trainer):
                 param.requires_grad = False
                 
         # get d loss
-        # d_loss = self._compute_loss_for_discriminator(model, inputs)
-        # self._backward_pass(d_loss, self.d_optimizer, update_optimizer=True, loss_name="discriminator_loss")
+        d_loss = self._compute_loss_for_discriminator(model, inputs)
+        self._backward_pass(d_loss, self.d_optimizer, update_optimizer=True, loss_name="discriminator_loss")
 
         for name, param in model.named_parameters():
             if "vision_tower" in name or "discriminator" in name:
