@@ -18,8 +18,6 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-import wandb
-
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -36,7 +34,7 @@ from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 
 from transformers.modeling_utils import *
 from transformers.modeling_utils import _add_variant
-import os
+import wandb
 
 
 class LlavaConfig(LlamaConfig):
@@ -63,11 +61,15 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             "image": None,
             "lang": None,
         }
+        
+        self.eval_mode = False
 
-        self.discriminator = Discriminator(5120)  # hard coding in sizes for now
+        if not self.eval_mode: 
+            self.discriminator = Discriminator(5120) # hard coding in sizes for now
 
         # Initialize weights and apply final processing
         self.post_init()
+
 
     def get_model(self):
         return self.model
@@ -106,6 +108,20 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 images,
                 image_sizes,
             )
+        
+        if self.eval_mode: 
+            return super().forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
 
         if d_mode == True:
             discrim_dict = self.discriminator.run_forward(
@@ -126,8 +142,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
             d_loss = discrim_dict["loss"]
             wandb.log({"disc_loss: ": d_loss})
-
-            model_output.loss = 0 * model_output.loss + d_loss  # returning only discriminator loss
+            model_output.loss = d_loss # returning only discriminator loss
 
             return model_output
         else:
@@ -147,8 +162,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 return_dict=return_dict,
             )
 
-
-            # wandb.log({"disc_loss: ": d_loss})
             wandb.log({"model_loss": model_output.loss})
             wandb.log({"generator_disc_loss": d_loss}) # generator on fake labels 
             model_output.loss = model_output.loss + d_loss
