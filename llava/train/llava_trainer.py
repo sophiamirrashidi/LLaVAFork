@@ -47,16 +47,16 @@ from transformers.trainer import (
 )
 
 from typing import List, Optional, Union
-import wandb 
-
-wandb.init(
-    project="llava_safety"
-)
+import wandb
 
 TRAINER_STATE_NAME = "trainer_state.json"
 lr = 0.0002
 beta1 = 0.5
-  
+
+#os.environ['WANDB_MODE'] = 'disabled'
+wandb.init(
+    project="llava_safety"
+)
 
 def maybe_zero_3(param, ignore_status=False, name=None):
     from deepspeed import zero
@@ -795,89 +795,65 @@ class LLaVATrainer(Trainer):
 
         return TrainOutput(self.state.global_step, train_loss, metrics)
     
-    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], dmode: bool = False) -> torch.Tensor:
-
-        inputs['d_mode'] = dmode
-        rank = int(os.environ.get('RANK', -1))
-        local_rank = int(os.environ.get('LOCAL_RANK', -1))
-
-        torch.cuda.set_device(local_rank)
-
-        if dmode:
-            # Enable gradients only for the discriminator, disable for all else
-            for name, param in model.named_parameters():
-                if "discriminator" in name:
-                    param.requires_grad = True
-                else:
-                    param.requires_grad = False
-        else:
-            # Enable gradients only for main model and mm_projector; keep vision_tower frozen and freeze discriminator
-            for name, param in model.named_parameters():
-                if "vision_tower" in name or "discriminator" in name:
-                    param.requires_grad = False
-                else:
-                    param.requires_grad = True
-
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        """
+        gan style, compute d_loss and g_loss and update optimizers accordingly
+        """
         model.train()
-        inputs = self._prepare_inputs(inputs) 
+        inputs = self._prepare_inputs(inputs)
 
-        if is_sagemaker_mp_enabled():
-            loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
-            return loss_mb.reduce_mean().detach().to(self.args.device)
+        for name, param in model.named_parameters():
+            if "discriminator" in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+                
+        # get d loss
+        d_loss = self._compute_loss_for_discriminator(model, inputs)
+        self._backward_pass(d_loss, self.d_optimizer, update_optimizer=True, loss_name="discriminator_loss")
 
+        for name, param in model.named_parameters():
+            if "vision_tower" in name or "discriminator" in name:
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
+        # get g loss
+        g_loss = self._compute_loss_for_generator(model, inputs)
+        self._backward_pass(g_loss, self.optimizer, update_optimizer=False, loss_name="generator_loss")
+
+
+        total_loss = d_loss.detach() + g_loss.detach()
+        return total_loss / self.args.gradient_accumulation_steps
+
+    def _compute_loss_for_discriminator(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        inputs['d_mode'] = True  # enable discriminator mode
         with self.compute_loss_context_manager():
-            loss = self.compute_loss(model, inputs)
+            d_loss = self.compute_loss(model, inputs)
 
         if self.args.n_gpu > 1:
-            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+            d_loss = d_loss.mean()  # average loss across multiple GPUs
 
+        return d_loss
+
+    def _compute_loss_for_generator(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        inputs['d_mode'] = False  # enable generator mode
+        with self.compute_loss_context_manager():
+            g_loss = self.compute_loss(model, inputs)
+
+        if self.args.n_gpu > 1:
+            g_loss = g_loss.mean()  # Average loss across multiple GPUs
+
+        return g_loss
+
+    def _backward_pass(self, loss: torch.Tensor, optimizer, update_optimizer: bool, loss_name: str):
+        
         if self.use_apex:
-            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+            with amp.scale_loss(loss, optimizer) as scaled_loss:
                 scaled_loss.backward()
         else:
-            self.accelerator.backward(loss)
-        
-        # if dmode: 
-        #     wandb.log({"disc_loss": loss})
+            self.accelerator.backward(loss)  # backwards pass
 
-        return loss.detach() / self.args.gradient_accumulation_steps
-
-    def training_step_handler(self, model, inputs): 
-        return self.training_step(model, inputs, True) + self.training_step(model, inputs, False) 
-
-    def compute_loss(self, model, inputs, return_outputs=False):
-        """
-        How the loss is computed by Trainer. By default, all models return the loss in the first element.
-
-        Subclass and override for custom behavior.
-        """
-        if self.label_smoother is not None and "labels" in inputs:
-            labels = inputs.pop("labels")
-        else:
-            labels = None
-        outputs = model(**inputs)
-        # Save past state if it exists
-        # TODO: this needs to be fixed and made cleaner later.
-        if self.args.past_index >= 0:
-            self._past = outputs[self.args.past_index]
-
-        if labels is not None:
-            unwrapped_model = unwrap_model(model)
-            if _is_peft_model(unwrapped_model):
-                model_name = unwrapped_model.base_model.model._get_name()
-            else:
-                model_name = unwrapped_model._get_name()
-            if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
-                loss = self.label_smoother(outputs, labels, shift_labels=True)
-            else:
-                loss = self.label_smoother(outputs, labels)
-        else:
-            if isinstance(outputs, dict) and "loss" not in outputs:
-                raise ValueError(
-                    "The model did not return a loss from the inputs, only the following keys: "
-                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
-                )
-            # We don't use .loss here since the model may return tuples instead of ModelOutput.
-            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-
-        return (loss, outputs) if return_outputs else loss
+        # only update d_optimizer (we want g_optimizer to go through grad clips)
+        if update_optimizer:
+            optimizer.step()
+            optimizer.zero_grad()
