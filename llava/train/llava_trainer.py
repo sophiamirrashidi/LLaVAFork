@@ -222,8 +222,15 @@ class LLaVATrainer(Trainer):
             if self.args.mm_projector_lr is not None:
                 projector_parameters = [name for name, _ in opt_model.named_parameters() if "mm_projector" in name and not "deep" in name]
                 deep_proj_parameters = [name for name, _ in opt_model.named_parameters() if "deep_mm_projector" in name]
-                #discriminator_parameters = [name for name, _ in opt_model.named_parameters() if "discriminator" in name]
+                discriminator_parameters = [name for name, _ in opt_model.named_parameters() if "discriminator" in name]
                 optimizer_grouped_parameters = [
+                    {
+                        "params": [
+                            p for n, p in opt_model.named_parameters() if (n in discriminator_parameters and p.requires_grad)
+                        ],
+                        "weight_decay": 0,
+                        "lr": lr,
+                    },
                     {
                         "params": [
                             p for n, p in opt_model.named_parameters() if (n in decay_parameters and n in projector_parameters and p.requires_grad)
@@ -240,7 +247,7 @@ class LLaVATrainer(Trainer):
                     },
                     {
                         "params": [
-                            p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n in deep_proj_parameters)
+                            p for n, p in opt_model.named_parameters() if n in deep_proj_parameters
                         ],
                         "weight_decay": 0.0,
                         "lr": 2e-3,
@@ -640,7 +647,7 @@ class LLaVATrainer(Trainer):
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
                 with self.accelerator.accumulate(model):
-                    tr_loss_step = self.training_step(model, inputs, step)
+                    tr_loss_step = self.training_step(model, inputs, step, epoch)
 
                 if (
                     args.logging_nan_inf_filter
@@ -829,24 +836,25 @@ class LLaVATrainer(Trainer):
             if "mm_projector" in name: 
                 param.requires_grad = False
     
-    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], step: int) -> torch.Tensor:
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], step: int, epoch: int) -> torch.Tensor:
         """
         gan style, compute d_loss and g_loss and update optimizers accordingly
         """
+        print("step: ", step)
+        print("epoch: ", epoch)
         discriminator_params = [p for n, p in model.named_parameters() if "discriminator" in n]
         model.train()
         inputs = self._prepare_inputs(inputs)
 
         d_loss = None
-        if step > 200: # for the first 200 steps only train the discriminator
-            # get d loss
-            self.discriminator_on(model)
-            #self.projector_off(model)
-            d_loss = self._compute_loss_for_discriminator(model, inputs)
-            self._backward_pass(d_loss, self.d_optimizer, update_optimizer=True, loss_name="discriminator_loss", discriminator_params=discriminator_params)
+        # get d loss
+        self.discriminator_on(model)
+        self.projector_off(model)
+        d_loss = self._compute_loss_for_discriminator(model, inputs)
+        self._backward_pass(d_loss, self.d_optimizer, update_optimizer=True, loss_name="discriminator_loss", discriminator_params=discriminator_params)
 
         self.discriminator_off(model)
-        #self.projector_on(model)
+        self.projector_on(model)
         # get g loss
         g_loss = self._compute_loss_for_generator(model, inputs)
         self._backward_pass(g_loss, self.optimizer, update_optimizer=False, loss_name="generator_loss")

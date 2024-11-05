@@ -57,7 +57,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             "lang": None,
         }
         
-        self.eval_mode = False
+        self.eval_mode = True
         self.initialize_deep_mm_projector()
 
         if not self.eval_mode: 
@@ -209,7 +209,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 return_dict=return_dict
             )
             
-            model_output.loss = 2 * model_output.loss + d_loss # returning sum of model and discriminator loss
+            model_output.loss = 1.5 * model_output.loss + d_loss # returning sum of model and discriminator loss
             wandb.log({"generator_disc loss": d_loss})
             wandb.log({"generator loss": model_output.loss - d_loss})
 
