@@ -80,8 +80,6 @@ class Discriminator(nn.Module):
 
             img_is_correct = torch.eq(img_pred_binary, img_label).to(device)
             lang_is_correct = torch.eq(lang_pred_binary, lang_label).to(device)
-            # img_is_correct = torch.eq(img_pred_binary, img_label)
-            # lang_is_correct = torch.eq(lang_pred_binary, lang_label)
 
             img_total = img_is_correct.size(0)
             lang_total = lang_is_correct.size(0)
@@ -93,8 +91,6 @@ class Discriminator(nn.Module):
         else:
             lang_label = torch.full((img_tok.size(0), 1), 0, dtype=torch.bfloat16, device=device)
             lang_label = torch.full((img_tok.size(0), 1), 0, dtype=torch.bfloat16, device=device)
-            # lang_label = torch.full(
-            #     (img_tok.size(0), 1), 0, dtype=torch.bfloat16, device=torch.device(f'cuda:{local_rank}')
-            # )
+
             img_with_lang_label_loss = loss_function(img_pred, lang_label)
             return img_with_lang_label_loss

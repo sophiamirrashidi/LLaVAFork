@@ -148,10 +148,12 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             )
 
 
-            wandb.log({"generator_loss": model_output.loss - d_loss})
-            wandb.log({"summed_loss": model_output.loss})
             # wandb.log({"disc_loss: ": d_loss})
+            wandb.log({"model_loss": model_output.loss})
+            wandb.log({"generator_disc_loss": d_loss}) # generator on fake labels 
             model_output.loss = model_output.loss + d_loss
+            wandb.log({"summed_loss": model_output.loss})
+
                 
         return model_output
 
