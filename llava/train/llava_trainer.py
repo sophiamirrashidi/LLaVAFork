@@ -643,7 +643,7 @@ class LLaVATrainer(Trainer):
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
                 with self.accelerator.accumulate(model):
-                    tr_loss_step = self.training_step_handler(model, inputs)
+                    tr_loss_step = self.training_step(model, inputs)
 
                 if (
                     args.logging_nan_inf_filter
@@ -692,7 +692,6 @@ class LLaVATrainer(Trainer):
 
                     # Optimizer step
                     self.optimizer.step()
-                    self.d_optimizer.step()
 
                     optimizer_was_run = not self.accelerator.optimizer_step_was_skipped
                     if optimizer_was_run:
@@ -809,8 +808,8 @@ class LLaVATrainer(Trainer):
                 param.requires_grad = False
                 
         # get d loss
-        d_loss = self._compute_loss_for_discriminator(model, inputs)
-        self._backward_pass(d_loss, self.d_optimizer, update_optimizer=True, loss_name="discriminator_loss")
+        # d_loss = self._compute_loss_for_discriminator(model, inputs)
+        # self._backward_pass(d_loss, self.d_optimizer, update_optimizer=True, loss_name="discriminator_loss")
 
         for name, param in model.named_parameters():
             if "vision_tower" in name or "discriminator" in name:
@@ -822,7 +821,7 @@ class LLaVATrainer(Trainer):
         self._backward_pass(g_loss, self.optimizer, update_optimizer=False, loss_name="generator_loss")
 
 
-        total_loss = d_loss.detach() + g_loss.detach()
+        total_loss =  g_loss.detach() # + d_loss.detach() TODO: uncomment when not doing j generator finetuning
         return total_loss / self.args.gradient_accumulation_steps
 
     def _compute_loss_for_discriminator(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:

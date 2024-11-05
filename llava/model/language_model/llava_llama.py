@@ -122,9 +122,11 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
             )
+        
+        d_mode = False
 
         if d_mode == True:
-            discrim_dict = self.discriminator.run_forward(
+            discrim_dict = self.discriminator.forward(
                 self.disc_data, d_mode=True
             )  # d loss is sum of disc loss on images and lang
             model_output = super().forward(
@@ -147,9 +149,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
             return model_output
         else:
-            d_loss = self.discriminator.run_forward(
-                self.disc_data, d_mode=False
-            )  # d loss is sum of disc loss on images and lang; same call in both if and else
+            # d_loss = self.discriminator.forward(
+            #     self.disc_data, d_mode=False
+            # )  # d loss is sum of disc loss on images and lang; same call in both if and else
             model_output = super().forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -163,11 +165,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 return_dict=return_dict,
             )
             
-            model_output.loss = model_output.loss + d_loss # returning sum of model and discriminator loss
             wandb.log({"model_loss": model_output.loss})
-            wandb.log({"generator_disc_loss": d_loss}) # generator on fake labels 
-            model_output.loss = model_output.loss + d_loss
-            wandb.log({"summed_loss": model_output.loss})
+            # wandb.log({"generator_disc_loss": d_loss}) # generator on fake labels 
+            # model_output.loss = model_output.loss + d_loss
+            # wandb.log({"summed_loss": model_output.loss})
 
                 
         return model_output
@@ -210,7 +211,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 image_sizes,
             )
 
-        discrim_dict = self.discriminator.run_forward(
+        discrim_dict = self.discriminator.forward(
             self.disc_data, d_mode=True
         )  # d loss is sum of disc loss on images and lang
 
