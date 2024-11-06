@@ -16,11 +16,15 @@ class Discriminator(nn.Module):
         return x
  
     def forward(self, data, d_mode):
-        device = 'cuda'  
+        local_rank = int(os.environ.get('LOCAL_RANK', -1))
+        device = torch.device(f'cuda:{local_rank}')
+
+        torch.cuda.set_device(local_rank)
+
         loss_function = nn.BCELoss()  # follow DCgan
 
         image_batch = data['image'][0].view(-1, 5120).to(device)
-        img_tok = image_batch.view(-1, 5120)  # flatten the lists
+        img_tok = image_batch.view(-1, 5120).to(device)  # flatten the lists
 
         img_pred = self.linear(img_tok)
         img_label = torch.full((img_tok.size(0), 1), 1, dtype=torch.bfloat16, device=device)  # use label 1 for imgs
@@ -41,23 +45,23 @@ class Discriminator(nn.Module):
             total_lang_loss += lang_loss
 
             #for accuracy calculations
-            lang_correct = torch.eq(torch.ge(lang_pred, 0.5).float().to(torch.bfloat16), lang_label).sum().item()
-            lang_correct_count += lang_correct
-            total_lang_preds += lang_pred.size(0)
+            # lang_correct = torch.eq(torch.ge(lang_pred, 0.5).float().to(torch.bfloat16), lang_label).sum().item()
+            # lang_correct_count += lang_correct
+            # total_lang_preds += lang_pred.size(0)
 
         if d_mode:
-            lang_accuracy = lang_correct_count / total_lang_preds * 100
-            print(f"Image Accuracy: {img_accuracy:.2f}%")
-            print(f"Language Accuracy: {lang_accuracy:.2f}%")
+            # lang_accuracy = lang_correct_count / total_lang_preds * 100
+            # print(f"Image Accuracy: {img_accuracy:.2f}%")
+            # print(f"Language Accuracy: {lang_accuracy:.2f}%")
 
             loss = img_loss + total_lang_loss
 
             return {
                 "loss": loss, 
-                "img_is_correct": img_correct_count, 
-                "lang_is_correct": lang_correct_count, 
-                "img_accuracy": img_accuracy, 
-                "lang_accuracy": lang_accuracy,
+                # "img_is_correct": img_correct_count, 
+                # "lang_is_correct": lang_correct_count, 
+                # "img_accuracy": img_accuracy, 
+                # "lang_accuracy": lang_accuracy,
             }
         
         else:
