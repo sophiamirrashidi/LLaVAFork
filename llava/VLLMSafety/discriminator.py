@@ -44,24 +44,24 @@ class Discriminator(nn.Module):
             lang_loss = loss_function(lang_pred, lang_label)
             total_lang_loss += lang_loss
 
-            #for accuracy calculations
-            # lang_correct = torch.eq(torch.ge(lang_pred, 0.5).float().to(torch.bfloat16), lang_label).sum().item()
-            # lang_correct_count += lang_correct
-            # total_lang_preds += lang_pred.size(0)
+            # for accuracy calculations
+            lang_correct = torch.eq(torch.ge(lang_pred, 0.5).float().to(torch.bfloat16), lang_label).sum().item()
+            lang_correct_count += lang_correct
+            total_lang_preds += lang_pred.size(0)
 
         if d_mode:
-            # lang_accuracy = lang_correct_count / total_lang_preds * 100
-            # print(f"Image Accuracy: {img_accuracy:.2f}%")
-            # print(f"Language Accuracy: {lang_accuracy:.2f}%")
+            lang_accuracy = lang_correct_count / total_lang_preds * 100
+            print(f"Image Accuracy: {img_accuracy:.2f}%")
+            print(f"Language Accuracy: {lang_accuracy:.2f}%")
 
             loss = img_loss + total_lang_loss
 
             return {
                 "loss": loss, 
-                # "img_is_correct": img_correct_count, 
-                # "lang_is_correct": lang_correct_count, 
-                # "img_accuracy": img_accuracy, 
-                # "lang_accuracy": lang_accuracy,
+                "img_is_correct": img_correct_count, 
+                "lang_is_correct": lang_correct_count, 
+                "img_accuracy": img_accuracy, 
+                "lang_accuracy": lang_accuracy,
             }
         
         else:
