@@ -146,12 +146,14 @@ class LlavaMetaForCausalLM(ABC):
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
         images, image_sizes=None
     ):
-        self.disc_data['image'] = []
-        self.disc_data['lang'] = [] 
-
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
+
+        assert images.ndim < 5, "image dimension exceeds 5 and this not implemented to handle that - remove extra preprocessing"
+        assert type(images) is not list, "image is type list and this not implemented to handle that - remove extra preprocessing"
+        # if statement will not run if above asserts pass, if it does then we have to remove the extra preprocessing 
+        # to ensure we have raw output from the mlp layers
 
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
@@ -204,9 +206,6 @@ class LlavaMetaForCausalLM(ABC):
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
             image_features = self.encode_images(images)
-            raw_image_features = image_features
-
-        self.disc_data['image'].append(raw_image_features)
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
@@ -257,14 +256,10 @@ class LlavaMetaForCausalLM(ABC):
             split_sizes = [x.shape[0] for x in cur_labels_noim]
             cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))
             cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
-
-
-            #curr input embeds is coming from cur_input_ids_noim which means its already filitered
-            self.disc_data['lang'].append(cur_input_embeds_no_im[1])
-            #print(f'self.disc_data: {self.disc_data}\n')
-
             cur_new_input_embeds = []
             cur_new_labels = []
+
+            chunk_sizes = [split_sizes[0], image_features.size(1), split_sizes[1]] # used for filtering for the discriminator
 
             for i in range(num_images + 1):
                 cur_new_input_embeds.append(cur_input_embeds_no_im[i])
@@ -318,6 +313,8 @@ class LlavaMetaForCausalLM(ABC):
                     new_labels_padded[i, :cur_len] = cur_new_labels
                     attention_mask[i, :cur_len] = True
                     position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
+                
+        assert torch.equal(new_input_embeds[0], new_input_embeds_padded[0]) == True, "padding changed the tensor in prepare_inputs_labels_for_multimodal, so tensor filtering will not work" 
 
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
 
@@ -334,7 +331,7 @@ class LlavaMetaForCausalLM(ABC):
         if _position_ids is None:
             position_ids = None
 
-        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
+        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, chunk_sizes
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
         if model_args.mm_use_im_patch_token:

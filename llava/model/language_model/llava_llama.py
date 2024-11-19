@@ -73,6 +73,48 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
     def get_model(self):
         return self.model
+    
+    def gan_forward(self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        images: Optional[torch.FloatTensor] = None,
+        image_sizes: Optional[List[List[int]]] = None,
+        return_dict: Optional[bool] = None,
+        ) -> Union[Tuple, CausalLMOutputWithPast]:
+
+        if inputs_embeds is None:
+            (
+                input_ids,
+                position_ids,
+                attention_mask,
+                past_key_values,
+                inputs_embeds,
+                labels,
+                chunk_sizes
+            ) = self.prepare_inputs_labels_for_multimodal(
+                input_ids,
+                position_ids,
+                attention_mask,
+                past_key_values,
+                labels,
+                images,
+                image_sizes,
+            )
+ 
+        split_embeddings = torch.split(inputs_embeds[0], chunk_sizes, dim=0)
+        lang_tkns = torch.cat((split_embeddings[0], split_embeddings[2]), 0)
+        # do we want to cut out the first bunch of tokens? 
+        lang_tkns = split_embeddings[2] # only the second to avoid adding the same tokens over and over 
+        img_tkns = split_embeddings[1]
+
+        return lang_tkns, img_tkns
 
     def forward(
         self,
@@ -88,8 +130,11 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
-        d_mode: Optional[bool] = False # True means only training discriminator
+        d_mode= None
         ) -> Union[Tuple, CausalLMOutputWithPast]:
+
+
+        return self.gan_forward(**{k: v for k, v in locals().items() if k != "self"}) # TODO ensure this calls gan_forward properly
 
         if inputs_embeds is None:
             (
@@ -166,7 +211,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             wandb.log({"generator_disc_loss": d_loss}) # generator on fake labels 
             model_output.loss = model_output.loss + d_loss
             wandb.log({"summed_loss": model_output.loss})
-
                 
         return model_output
 
