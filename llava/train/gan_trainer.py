@@ -189,6 +189,53 @@ class GANTrainer(Trainer):
         if self.args.place_model_on_device:
             self._move_model_to_device(self.discriminator, self.args.device)
 
+    def create_accelerator_and_postprocess(self):
+        grad_acc_kwargs = {"num_steps": self.args.gradient_accumulation_steps}
+        grad_acc_kwargs["sync_with_dataloader"] = False
+        gradient_accumulation_plugin = GradientAccumulationPlugin(**grad_acc_kwargs)
+
+        # create accelerator object
+        self.accelerator = Accelerator(
+            dispatch_batches=self.args.dispatch_batches,
+            split_batches=self.args.split_batches,
+            deepspeed_plugin=self.args.deepspeed_plugin,
+            gradient_accumulation_plugin=gradient_accumulation_plugin,
+        )
+
+        # THIS IS THE ONLY CHANGE TO THIS FUNCTION: ADDING AN ACCELERATOR FOR THE DISC
+        self.disc_accelerator = Accelerator(
+            dispatch_batches=self.args.dispatch_batches,
+            split_batches=self.args.split_batches,
+            deepspeed_plugin=self.args.deepspeed_plugin,
+            gradient_accumulation_plugin=gradient_accumulation_plugin,
+        )
+        # some Trainer classes need to use `gather` instead of `gather_for_metrics`, thus we store a flag
+        self.gather_function = self.accelerator.gather_for_metrics
+
+        # deepspeed and accelerate flags covering both trainer args and accelerate launcher
+        self.is_deepspeed_enabled = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
+        self.is_fsdp_enabled = getattr(self.accelerator.state, "fsdp_plugin", None) is not None
+
+        # post accelerator creation setup
+        if self.is_fsdp_enabled:
+            fsdp_plugin = self.accelerator.state.fsdp_plugin
+            fsdp_plugin.limit_all_gathers = self.args.fsdp_config.get(
+                "limit_all_gathers", fsdp_plugin.limit_all_gathers
+            )
+            if is_accelerate_available("0.23.0"):
+                fsdp_plugin.activation_checkpointing = self.args.fsdp_config.get(
+                    "activation_checkpointing", fsdp_plugin.activation_checkpointing
+                )
+                if fsdp_plugin.activation_checkpointing and self.args.gradient_checkpointing:
+                    raise ValueError(
+                        "The activation_checkpointing in FSDP config and the gradient_checkpointing in training arg "
+                        "can't be set to True simultaneously. Please use FSDP's activation_checkpointing logic "
+                        "when using FSDP."
+                    )
+
+        if self.is_deepspeed_enabled and getattr(self.args, "hf_deepspeed_config", None) is None:
+            self.propagate_args_to_deepspeed()
+
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.train_dataset is None or not has_length(self.train_dataset):
             return None
@@ -302,7 +349,7 @@ class GANTrainer(Trainer):
 
         self.d_optimizer = optim.Adam(self.discriminator.parameters(), lr= lr, betas=(beta1, 0.999))
 
-        return self.optimizer, self.d_optimizer
+        return self.optimizer
 
     def _save_checkpoint(self, model, trial, metrics=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
@@ -479,8 +526,8 @@ class GANTrainer(Trainer):
                     self.model, self.optimizer, self.lr_scheduler
                 )
         # TODO ensure this works correctly with the accelerator
-        self.discriminator = self.accelerator.prepare(self.discriminator)
-        self.d_optimizer = self.accelerator.prepare(self.d_optimizer)
+        self.discriminator = self.disc_accelerator.prepare(self.discriminator)
+        self.d_optimizer = self.disc_accelerator.prepare(self.d_optimizer)
         
         for param in self.discriminator.parameters():
             if torch.any(torch.isnan(param.data)):
@@ -575,7 +622,8 @@ class GANTrainer(Trainer):
         self.state.is_world_process_zero = self.is_world_process_zero()
 
         # tr_loss is a tensor to avoid synchronization of TPUs through .item()
-        tr_loss = torch.tensor(0.0).to(args.device)
+        gen_loss = torch.tensor(0.0).to(args.device)
+        disc_loss = torch.tensor(0.0).to(args.device)
         # _total_loss_scalar is updated everytime .item() has to be called on tr_loss and stores the sum of all losses
         self._total_loss_scalar = 0.0
         self._globalstep_last_logged = self.state.global_step
@@ -663,64 +711,122 @@ class GANTrainer(Trainer):
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
                 
                 discriminator.zero_grad()
-                disc_loss, gen_loss = self.training_step(model, discriminator, inputs)
+                # get tokens and output from the model 
+                with self.accelerator.accumulate(model):
+                    output, model_loss = self.training_step(model, inputs)
+
+                lang_tkn_list = output[lang_tkn_list]
+                img_tkn_list = output[img_tkn_list]
+
+                #######################
+                # Train Discriminator #
+                #######################
+                
+                with self.disc_accelerator.accumulate(self.discriminator):
+                    disc_tr_loss_step = self.disc_training_step(model, discriminator, lang_tkn_list, img_tkn_list)
 
                 if (
                     args.logging_nan_inf_filter
                     and not is_torch_tpu_available()
-                    and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
+                    and (torch.isnan(disc_tr_loss_step) or torch.isinf(disc_tr_loss_step))
                 ):
-                    # if loss is nan or inf simply add the average of previous logged losses
-                    tr_loss += tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
+                    # If loss is NaN or Inf, replace with average of previous logged losses
+                    disc_loss += disc_loss / (1 + self.state.global_step - self._globalstep_last_logged)
                 else:
-                    tr_loss += tr_loss_step
+                    disc_loss += disc_tr_loss_step
 
+                # Update FLOPs for discriminator
                 self.current_flos += float(self.floating_point_ops(inputs))
 
+                # Check if it's the last step and handle gradient synchronization
                 is_last_step_and_steps_less_than_grad_acc = (
                     steps_in_epoch <= args.gradient_accumulation_steps and (step + 1) == steps_in_epoch
                 )
 
                 if (
                     total_batched_samples % args.gradient_accumulation_steps == 0
-                    or
-                    # last step in epoch but step is always smaller than gradient_accumulation_steps
-                    is_last_step_and_steps_less_than_grad_acc
+                    or is_last_step_and_steps_less_than_grad_acc
                 ):
-                    # the `or` condition of `is_last_step_and_steps_less_than_grad_acc` is not covered
-                    # in accelerate. So, explicitly enable sync gradients to True in that case.
+                    # Enable gradient synchronization explicitly if this is the last step
+                    if is_last_step_and_steps_less_than_grad_acc:
+                        self.disc_accelerator.gradient_state._set_sync_gradients(True)
+
+                    # Gradient clipping for discriminator
+                    if args.max_grad_norm is not None and args.max_grad_norm > 0:
+                        if is_sagemaker_mp_enabled() and args.fp16:
+                            self.d_optimizer.clip_master_grads(args.max_grad_norm)
+                        elif self.use_apex:
+                            nn.utils.clip_grad_norm_(
+                                amp.master_params(self.d_optimizer),
+                                args.max_grad_norm,
+                            )
+                        else:
+                            self.disc_accelerator.clip_grad_norm_(
+                                discriminator.parameters(),
+                                args.max_grad_norm,
+                            )
+            
+                    self.d_optimizer.step() # TODO ensure this indentation is correct
+                    discriminator.zero_grad()
+                    self.d_optimizer.zero_grad()
+
+                ###################
+                # Train Generator #
+                ###################
+                        
+                gen_disc_loss = self.get_gen_loss(model, discriminator, img_tkn_list)
+                gen_loss_step = model_loss + gen_disc_loss
+
+                if self.use_apex:
+                    with amp.scale_loss(gen_loss_step, self.optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    self.accelerator.backward(gen_loss_step)
+
+                if (
+                    args.logging_nan_inf_filter
+                    and not is_torch_tpu_available()
+                    and (torch.isnan(gen_loss_step) or torch.isinf(gen_loss_step))
+                ):
+                    # If loss is NaN or Inf, replace with average of previous logged losses
+                    gen_loss += gen_loss_step / (1 + self.state.global_step - self._globalstep_last_logged)
+                else:
+                    gen_loss += gen_loss_step
+
+                # Update FLOPs for generator
+                self.current_flos += float(self.floating_point_ops(inputs))
+
+                # Check if it's the last step and handle gradient synchronization
+                is_last_step_and_steps_less_than_grad_acc = (
+                    steps_in_epoch <= args.gradient_accumulation_steps and (step + 1) == steps_in_epoch
+                )
+
+                if (
+                    total_batched_samples % args.gradient_accumulation_steps == 0
+                    or is_last_step_and_steps_less_than_grad_acc
+                ):
+                    # Enable gradient synchronization explicitly if this is the last step
                     if is_last_step_and_steps_less_than_grad_acc:
                         self.accelerator.gradient_state._set_sync_gradients(True)
 
-                    # Gradient clipping
+                    # Gradient clipping for generator
                     if args.max_grad_norm is not None and args.max_grad_norm > 0:
-                        # deepspeed does its own clipping
-
                         if is_sagemaker_mp_enabled() and args.fp16:
                             self.optimizer.clip_master_grads(args.max_grad_norm)
                         elif self.use_apex:
-                            # Revert to normal clipping otherwise, handling Apex or full precision
                             nn.utils.clip_grad_norm_(
                                 amp.master_params(self.optimizer),
                                 args.max_grad_norm,
                             )
                         else:
-                            self.accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-
-                    optimizer_was_run = not self.accelerator.optimizer_step_was_skipped
-                    if optimizer_was_run:
-                        # Delay optimizer scheduling until metrics are generated
-                        if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                            self.lr_scheduler.step()
-
-                    self.state.global_step += 1
-                    self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
-                    self.control = self.callback_handler.on_step_end(args, self.state, self.control)
-
-                    self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
-            # self._maybe_log_save_evaluate(tr_loss, disc_loss, summed_loss, model, trial, epoch, ignore_keys_for_eval)
-                else:
-                    self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
+                            self.accelerator.clip_grad_norm_(
+                                model.parameters(),
+                                args.max_grad_norm,
+                            )
+            
+                    self.optimizer.step() # TODO ensure this indentation is correct
+                    model.zero_grad()
+                    self.optimizer.zero_grad()
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
@@ -733,8 +839,7 @@ class GANTrainer(Trainer):
                 self.control.should_training_stop = True
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
-            self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
-            # self._maybe_log_save_evaluate(tr_loss, disc_loss, summed_loss, model, trial, epoch, ignore_keys_for_eval)
+            self._maybe_log_save_evaluate(gen_loss, model, trial, epoch, ignore_keys_for_eval)
 
             if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
                 if is_torch_tpu_available():
@@ -765,7 +870,7 @@ class GANTrainer(Trainer):
             self._load_best_model()
 
         # add remaining tr_loss
-        self._total_loss_scalar += tr_loss.item()
+        self._total_loss_scalar += gen_loss.item()
         train_loss = self._total_loss_scalar / self.state.global_step
 
         metrics = speed_metrics(
@@ -807,119 +912,6 @@ class GANTrainer(Trainer):
 
         return TrainOutput(self.state.global_step, train_loss, metrics)
 
-    def training_step(self, model, discriminator, inputs):
-        "one training step of the gan"
-
-        inputs = self._prepare_inputs(inputs)
-        # get tokens from the model 
-        lang_tkns, img_tkns = model(**inputs)
-
-        #######################
-        # Train Discriminator #
-        #######################
-        
-        with self.accelerator.accumulate(self.discriminator):
-            disc_tr_loss_step = self.disc_training_step(model, discriminator, lang_tkns.detach(), img_tkns.detach())
-                        
-        if (
-            args.logging_nan_inf_filter
-            and not is_torch_tpu_available()
-            and (torch.isnan(disc_loss_step) or torch.isinf(disc_loss_step))
-        ):
-            # If loss is NaN or Inf, replace with average of previous logged losses
-            disc_loss += disc_loss / (1 + self.state.global_step - self._globalstep_last_logged)
-        else:
-            disc_loss += disc_loss_step
-
-        # Update FLOPs for discriminator
-        self.current_flos += float(self.floating_point_ops(inputs))
-
-        # Check if it's the last step and handle gradient synchronization
-        is_last_step_and_steps_less_than_grad_acc = (
-            steps_in_epoch <= args.gradient_accumulation_steps and (step + 1) == steps_in_epoch
-        )
-
-        if (
-            total_batched_samples % args.gradient_accumulation_steps == 0
-            or is_last_step_and_steps_less_than_grad_acc
-        ):
-            # Enable gradient synchronization explicitly if this is the last step
-            if is_last_step_and_steps_less_than_grad_acc:
-                self.accelerator.gradient_state._set_sync_gradients(True)
-
-            # Gradient clipping for discriminator
-            if args.max_grad_norm is not None and args.max_grad_norm > 0:
-                if is_sagemaker_mp_enabled() and args.fp16:
-                    self.d_optimizer.clip_master_grads(args.max_grad_norm)
-                elif self.use_apex:
-                    nn.utils.clip_grad_norm_(
-                        amp.master_params(self.d_optimizer),
-                        args.max_grad_norm,
-                    )
-                else:
-                    self.accelerator.clip_grad_norm_(
-                        discriminator.parameters(),
-                        args.max_grad_norm,
-                    )
-       
-        self.d_optimizer.step()
-        discriminator.zero_grad()
-        self.d_optimizer.zero_grad()
-
-        ###################
-        # Train Generator #
-        ###################
-                
-        with self.accelerator.accumulate(model):
-            gen_tr_loss_step = self.get_gen_loss(model, discriminator, img_tkns)
-
-        if (
-            args.logging_nan_inf_filter
-            and not is_torch_tpu_available()
-            and (torch.isnan(gen_loss_step) or torch.isinf(gen_loss_step))
-        ):
-            # If loss is NaN or Inf, replace with average of previous logged losses
-            gen_loss += gen_loss / (1 + self.state.global_step - self._globalstep_last_logged)
-        else:
-            gen_loss += gen_loss_step
-
-        # Update FLOPs for generator
-        self.current_flos += float(self.floating_point_ops(inputs))
-
-        # Check if it's the last step and handle gradient synchronization
-        is_last_step_and_steps_less_than_grad_acc = (
-            steps_in_epoch <= args.gradient_accumulation_steps and (step + 1) == steps_in_epoch
-        )
-
-        if (
-            total_batched_samples % args.gradient_accumulation_steps == 0
-            or is_last_step_and_steps_less_than_grad_acc
-        ):
-            # Enable gradient synchronization explicitly if this is the last step
-            if is_last_step_and_steps_less_than_grad_acc:
-                self.accelerator.gradient_state._set_sync_gradients(True)
-
-            # Gradient clipping for generator
-            if args.max_grad_norm is not None and args.max_grad_norm > 0:
-                if is_sagemaker_mp_enabled() and args.fp16:
-                    self.optimizer.clip_master_grads(args.max_grad_norm)
-                elif self.use_apex:
-                    nn.utils.clip_grad_norm_(
-                        amp.master_params(self.optimizer),
-                        args.max_grad_norm,
-                    )
-                else:
-                    self.accelerator.clip_grad_norm_(
-                        model.parameters(),
-                        args.max_grad_norm,
-                    )
-        
-        self.optimizer.step()
-        model.zero_grad()
-        self.optimizer.zero_grad()
-
-        return disc_tr_loss_step, gen_tr_loss_step
-
     def get_disc_loss(self, discriminator, lang_tkns, img_tkns):
         "run the forward pass through the discriminator and get the loss, call backwards"
         discriminator.train()
@@ -931,21 +923,70 @@ class GANTrainer(Trainer):
             disc_loss = disc_loss.mean()
 
         # call backwards on discriminator  
-        self.accelerator.backward(disc_loss)
+        self.disc_accelerator.backward(disc_loss)
  
         return disc_loss.detach() / self.args.gradient_accumulation.steps
 
     def get_gen_loss(self, model: nn.Module, discriminator, img_tkns) -> torch.Tensor:
-        "run the disc forward pass to get the loss of the generator"
+        "run the disc forward pass to get the loss of the generator, call backwards"
 
-        model.train()
-
-        gen_disc_loss = discriminator.forward(img_tkns, d_mode=False) # getting the loss with the mismatched, confirm the detach
+        gen_disc_loss = discriminator.forward(img_tkns, d_mode=False) # getting the loss with the mismatched
 
         if self.args.n_gpu > 1:
             gen_disc_loss = gen_disc_loss.mean()  # mean() to average on multi-gpu parallel training
-
-        self.accelerator.backward(gen_disc_loss)    
         
         return gen_disc_loss.detach() / self.args.gradient_accumulation_steps
     
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        """
+        overwritten to also return the model outputs which will have the tokens
+        """
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        if is_sagemaker_mp_enabled():
+            loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
+            return loss_mb.reduce_mean().detach().to(self.args.device)
+
+        with self.compute_loss_context_manager():
+            loss, output = self.compute_loss(model, inputs)
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+        return output, loss.detach() / self.args.gradient_accumulation_steps
+    
+    def compute_loss(self, model, inputs, return_outputs=True):
+        """
+        subclassed to return the outputs along with the loss
+        """
+        if self.label_smoother is not None and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+        outputs = model(**inputs)
+        # Save past state if it exists
+        # TODO: this needs to be fixed and made cleaner later.
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        if labels is not None:
+            unwrapped_model = unwrap_model(model)
+            if _is_peft_model(unwrapped_model):
+                model_name = unwrapped_model.base_model.model._get_name()
+            else:
+                model_name = unwrapped_model._get_name()
+            if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+                loss = self.label_smoother(outputs, labels, shift_labels=True)
+            else:
+                loss = self.label_smoother(outputs, labels)
+        else:
+            if isinstance(outputs, dict) and "loss" not in outputs:
+                raise ValueError(
+                    "The model did not return a loss from the inputs, only the following keys: "
+                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+                )
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        return (loss, outputs) if return_outputs else loss

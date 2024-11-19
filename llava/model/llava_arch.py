@@ -154,12 +154,15 @@ class LlavaMetaForCausalLM(ABC):
         assert type(images) is not list, "image is type list and this not implemented to handle that - remove extra preprocessing"
         # if statement will not run if above asserts pass, if it does then we have to remove the extra preprocessing 
         # to ensure we have raw output from the mlp layers
+        image_feature_list = []
+        lang_tkn_list = []
 
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
             raw_image_features = self.encode_images(concat_images)
+            image_feature_list.append(raw_image_features.detach())
             image_features = raw_image_features
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
@@ -240,6 +243,7 @@ class LlavaMetaForCausalLM(ABC):
             if num_images == 0:
                 cur_image_features = image_features[cur_image_idx]
                 cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
+                lang_tkn_list.append(cur_input_embeds_1.detach())
                 cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
                 new_input_embeds.append(cur_input_embeds)
                 new_labels.append(labels[batch_idx])
@@ -277,6 +281,12 @@ class LlavaMetaForCausalLM(ABC):
 
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
+
+            split_embeddings = torch.split(new_input_embeds[0], chunk_sizes, dim=0)
+            lang_tkns = torch.cat((split_embeddings[0], split_embeddings[2]), 0)
+            # do we want to cut out the first bunch of tokens? 
+            lang_tkns = split_embeddings[2] # only the second to avoid adding the same tokens over and over 
+            lang_tkn_list.append(lang_tkns.detach())
 
         # Truncate sequences to max length as image embeddings can make the sequence longer
         tokenizer_model_max_length = getattr(self.config, 'tokenizer_model_max_length', None)
@@ -331,7 +341,7 @@ class LlavaMetaForCausalLM(ABC):
         if _position_ids is None:
             position_ids = None
 
-        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, chunk_sizes
+        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, lang_tkn_list, image_feature_list
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
         if model_args.mm_use_im_patch_token:

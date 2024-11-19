@@ -57,15 +57,15 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         self.pretraining_tp = config.pretraining_tp
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.disc_data = {
-            "image": None,
-            "lang": None,
-        }
+        # self.disc_data = {
+        #     "image": None,
+        #     "lang": None,
+        # }
         
         self.eval_mode = False
 
-        if not self.eval_mode: 
-            self.discriminator = Discriminator(5120) # hard coding in sizes for now
+        # if not self.eval_mode: 
+        #     self.discriminator = Discriminator(5120) # hard coding in sizes for now
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -74,7 +74,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     def get_model(self):
         return self.model
     
-    def gan_forward(self,
+
+    def forward(
+        self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -97,7 +99,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 past_key_values,
                 inputs_embeds,
                 labels,
-                chunk_sizes
+                lang_tkn_list, 
+                img_tkn_list
             ) = self.prepare_inputs_labels_for_multimodal(
                 input_ids,
                 position_ids,
@@ -107,34 +110,24 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 images,
                 image_sizes,
             )
- 
-        split_embeddings = torch.split(inputs_embeds[0], chunk_sizes, dim=0)
-        lang_tkns = torch.cat((split_embeddings[0], split_embeddings[2]), 0)
-        # do we want to cut out the first bunch of tokens? 
-        lang_tkns = split_embeddings[2] # only the second to avoid adding the same tokens over and over 
-        img_tkns = split_embeddings[1]
 
-        return lang_tkns, img_tkns
-
-    def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        images: Optional[torch.FloatTensor] = None,
-        image_sizes: Optional[List[List[int]]] = None,
-        return_dict: Optional[bool] = None,
-        d_mode= None
-        ) -> Union[Tuple, CausalLMOutputWithPast]:
-
-
-        return self.gan_forward(**{k: v for k, v in locals().items() if k != "self"}) # TODO ensure this calls gan_forward properly
+        model_output = super().forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+        
+        model_output['lang_tkn_list'] = lang_tkn_list
+        model_output['img_tkn_list'] = img_tkn_list
+        
+        return model_output
 
         if inputs_embeds is None:
             (
@@ -213,50 +206,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             wandb.log({"summed_loss": model_output.loss})
                 
         return model_output
-
-    @torch.no_grad()
-    def forward_eval_discrim(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        images: Optional[torch.FloatTensor] = None,
-        image_sizes: Optional[List[List[int]]] = None,
-        return_dict: Optional[bool] = None,
-        d_mode: Optional[bool] = True,  # False means run without discriminator
-        eval_disc: Optional[bool] = True,
-    ):
-        
-
-        if inputs_embeds is None:
-            (
-                input_ids,
-                position_ids,
-                attention_mask,
-                past_key_values,
-                inputs_embeds,
-                labels,
-            ) = self.prepare_inputs_labels_for_multimodal(
-                input_ids,
-                position_ids,
-                attention_mask,
-                past_key_values,
-                labels,
-                images,
-                image_sizes,
-            )
-
-        discrim_dict = self.discriminator.run_forward(
-            self.disc_data, d_mode=True
-        )  # d loss is sum of disc loss on images and lang
-
-        return discrim_dict
 
     @torch.no_grad()
     def generate(

@@ -30,6 +30,8 @@ import tokenizers
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from torch.utils.data import Dataset
 from llava.train.llava_trainer import LLaVATrainer
+from llava.train.gan_trainer import GANTrainer
+from llava.VLLMSafety.discriminator import Discriminator
 
 from llava import conversation as conversation_lib
 from llava.model import *
@@ -171,7 +173,7 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
-    multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler', 'discriminator']
+    multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler'] 
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
@@ -973,18 +975,18 @@ def train(attn_implementation=None):
 
     # model.to("cuda")
     model.to(torch.device(f'cuda:{local_rank}'))
-    
-    for name, param in model.discriminator.named_parameters():
-        param.requires_grad = True
 
-    for name, param in model.discriminator.named_parameters():
-        assert param.requires_grad, f"Parameter {name} does not have requires_grad set to True"
+    discriminator = Discriminator(5120)
+
+    for p in discriminator.parameters():
+                p.requires_grad = True
 
     for name, param in model.get_model().mm_projector.named_parameters():
         assert param.requires_grad, f"Parameter {name} does not have requires_grad set to True" 
 
-    trainer = LLaVATrainer(model=model,
+    trainer = GANTrainer(model=model,
                     tokenizer=tokenizer,
+                    discriminator=discriminator,
                     args=training_args,
                     **data_module)
 
