@@ -282,12 +282,6 @@ class LLaVATrainer(Trainer):
                 logger.info(f"skipped: {skipped/2**20}M params")
 
         self.d_optimizer = optim.Adam(opt_model.discriminator.parameters(), lr= lr, betas=(beta1, 0.999)) # how to get discriminator parameters?
-
-        for name, param in opt_model.named_parameters():
-            if 'mm_projector' not in name and 'discriminator' not in name:
-                param.requires_grad = False
-        
-        # turn off all the params in the model that are not part of the projector or discriminator
         
         return self.optimizer
 
@@ -611,6 +605,7 @@ class LLaVATrainer(Trainer):
 
             step = -1
             for step, inputs in enumerate(epoch_iterator):
+                inputs['d_mode'] = True if step % 2 == 0 else False
                 total_batched_samples += 1
 
                 if self.args.include_num_input_tokens_seen:
@@ -799,17 +794,14 @@ class LLaVATrainer(Trainer):
         """
         gan style, compute d_loss and g_loss and update optimizers accordingly
         """
-        model.train()
         inputs = self._prepare_inputs(inputs)
 
-        # get d loss
-        for name, param in model.named_parameters():
-            if "discriminator" in name:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
-        d_loss = self._compute_loss_for_discriminator(model, inputs)
-        self._backward_pass(d_loss, self.d_optimizer, update_optimizer=True, loss_name="discriminator_loss")
+        if inputs['d_mode'] == True:
+            for name, param in model.named_parameters():
+                if "discriminator" in name:
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
 
 
         for name, param in model.named_parameters():

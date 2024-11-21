@@ -57,15 +57,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         self.pretraining_tp = config.pretraining_tp
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        # self.disc_data = {
-        #     "image": None,
-        #     "lang": None,
-        # }
-        
         self.eval_mode = False
 
-        # if not self.eval_mode: 
-        #     self.discriminator = Discriminator(5120) # hard coding in sizes for now
+        self.discriminator = Discriminator(5120) # hard coding in sizes for now
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -124,8 +118,19 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 return_dict=return_dict,
             )
         
-        model_output['lang_tkn_list'] = lang_tkn_list
-        model_output['img_tkn_list'] = img_tkn_list
+        if isinstance(img_tkn_list, list):
+            assert len(img_tkn_list) == 1, 'img tokens is not a list of length 1'
+            img_tkn_list = img_tkn_list[0]
+        else:  
+            print(f'len_img_tkns: {len(img_tkn_list)}, \n img_tkns: img_tkns')
+
+        img_tkn_list = img_tkn_list.view(-1, 5120)
+        # img_tkn_list = img_tkn_list[:1000]
+
+        lang_tkn_list = torch.cat(lang_tkn_list, dim=0) # batching the language tokens
+        # lang_tkn_list = lang_tkn_list[:1000]  
+        model_output['lang_tkns'] = lang_tkn_list
+        model_output['img_tkns'] = img_tkn_list
         
         return model_output
 

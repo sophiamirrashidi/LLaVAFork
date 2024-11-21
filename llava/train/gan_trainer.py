@@ -179,20 +179,8 @@ class LengthGroupedSampler(Sampler):
 
 
 class GANTrainer(Trainer):
-    def __init__(self, *args, discriminator=None, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs) 
-
-
-        def model_size(model):
-            total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            print(f"Model Size: {total_params * 4 / 1e6:.2f} MB (assuming 32-bit floats)")
-
-        model_size(discriminator)
-        
-        self.discriminator = discriminator.to(kwargs['args'].local_rank)
-        self.discriminator = DDP(discriminator, device_ids=[kwargs['args'].local_rank], find_unused_parameters=False)
-
-        print(model_size(discriminator))
 
     def create_accelerator_and_postprocess(self):
         grad_acc_kwargs = {"num_steps": self.args.gradient_accumulation_steps}
@@ -281,18 +269,14 @@ class GANTrainer(Trainer):
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
             if self.args.mm_projector_lr is not None:
                 projector_parameters = [name for name, _ in opt_model.named_parameters() if "mm_projector" in name]
+                discriminator_parameters = [name for name, _ in opt_model.named_parameters() if "discriminator" in name]
                 optimizer_grouped_parameters = [
                     {
                         "params": [
-                            p for n, p in opt_model.named_parameters() if (n in decay_parameters and n not in projector_parameters and p.requires_grad)
+                            p for n, p in opt_model.named_parameters() if (n in discriminator_parameters and p.requires_grad)
                         ],
-                        "weight_decay": self.args.weight_decay,
-                    },
-                    {
-                        "params": [
-                            p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n not in projector_parameters and p.requires_grad)
-                        ],
-                        "weight_decay": 0.0,
+                        "weight_decay": 0, # TODO: this can be a hyperparameter
+                        "lr": lr,
                     },
                     {
                         "params": [
@@ -343,10 +327,8 @@ class GANTrainer(Trainer):
                         logger.debug(f"bitsandbytes: will optimize {module} in fp32")
                 logger.info(f"skipped: {skipped/2**20}M params")
 
-        # Create optimizer for discriminator 
-
-        self.d_optimizer = optim.AdamW(self.discriminator.parameters(), lr= lr, betas=(beta1, 0.999))
-
+        self.d_optimizer = optim.Adam(opt_model.discriminator.parameters(), lr= lr, betas=(beta1, 0.999))
+        
         return self.optimizer
 
     def _save_checkpoint(self, model, trial, metrics=None):
@@ -674,6 +656,7 @@ class GANTrainer(Trainer):
 
             step = -1
             for step, inputs in enumerate(epoch_iterator):
+                inputs['d_mode'] = True if step % 2 == 0 else False
                 total_batched_samples += 1
 
                 if self.args.include_num_input_tokens_seen:
@@ -710,14 +693,14 @@ class GANTrainer(Trainer):
                 with self.accelerator.accumulate(model):
                     output, model_loss = self.training_step(model, inputs)
 
-                lang_tkn_list = output['lang_tkn_list']
-                img_tkn_list = output['img_tkn_list']
+                lang_tkns = output['lang_tkns']
+                img_tkns = output['img_tkns']
 
                 #######################
                 # Train Discriminator #
                 #######################
 
-                disc_tr_loss_step = self.get_disc_loss(discriminator, lang_tkn_list, img_tkn_list)
+                disc_tr_loss_step = self.get_disc_loss(discriminator, lang_tkns, img_tkns)
 
                 if (
                     args.logging_nan_inf_filter
@@ -757,7 +740,7 @@ class GANTrainer(Trainer):
                 # Train Generator #
                 ###################
                         
-                gen_disc_loss = self.get_gen_loss(discriminator, img_tkn_list)
+                gen_disc_loss = self.get_gen_loss(discriminator, img_tkns)
                 gen_loss_step = model_loss + gen_disc_loss
 
                 if self.use_apex:
@@ -898,24 +881,16 @@ class GANTrainer(Trainer):
         "run the forward pass through the discriminator and get the loss, call backwards"
         discriminator.train()
 
-        def log_memory_usage(stage):
-            print(f"[{stage}] Allocated: {torch.cuda.memory_allocated() / 1e6:.2f} MB")
-            print(f"[{stage}] Reserved: {torch.cuda.memory_reserved() / 1e6:.2f} MB")
-
-        log_memory_usage("Before Discriminator Forward")
         # calculate loss on real batch - forward pass through disc returns loss
         disc_loss = discriminator.forward(img_tkns, lang_tkns, d_mode=True) # d_mode here means we are not doing generator training step - using labels normally
 
         if self.args.n_gpu > 1:
             disc_loss = disc_loss.mean()
 
-        log_memory_usage("After Discriminator Forward")
-
         # call backwards on discriminator  
         with self.discriminator.no_sync(): 
             disc_loss.backward(retain_graph=False)
         
-        log_memory_usage("After Discriminator Backward")
 
         return disc_loss.detach() / self.args.gradient_accumulation_steps
 
