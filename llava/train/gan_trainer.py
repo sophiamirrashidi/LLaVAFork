@@ -181,9 +181,18 @@ class LengthGroupedSampler(Sampler):
 class GANTrainer(Trainer):
     def __init__(self, *args, discriminator=None, **kwargs):
         super().__init__(*args, **kwargs) 
+
+
+        def model_size(model):
+            total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"Model Size: {total_params * 4 / 1e6:.2f} MB (assuming 32-bit floats)")
+
+        model_size(discriminator)
         
         self.discriminator = discriminator.to(kwargs['args'].local_rank)
-        self.discriminator = DDP(discriminator, device_ids=[kwargs['args'].local_rank])
+        self.discriminator = DDP(discriminator, device_ids=[kwargs['args'].local_rank], find_unused_parameters=False)
+
+        print(model_size(discriminator))
 
     def create_accelerator_and_postprocess(self):
         grad_acc_kwargs = {"num_steps": self.args.gradient_accumulation_steps}
@@ -336,7 +345,7 @@ class GANTrainer(Trainer):
 
         # Create optimizer for discriminator 
 
-        self.d_optimizer = optim.Adam(self.discriminator.parameters(), lr= lr, betas=(beta1, 0.999))
+        self.d_optimizer = optim.AdamW(self.discriminator.parameters(), lr= lr, betas=(beta1, 0.999))
 
         return self.optimizer
 
@@ -719,9 +728,30 @@ class GANTrainer(Trainer):
                     disc_loss += disc_loss / (1 + self.state.global_step - self._globalstep_last_logged)
                 else:
                     disc_loss += disc_tr_loss_step
-            
-                    self.d_optimizer.zero_grad()
+
+                # Check if it's the last step and handle gradient synchronization
+                is_last_step_and_steps_less_than_grad_acc = (
+                    steps_in_epoch <= args.gradient_accumulation_steps and (step + 1) == steps_in_epoch
+                )
+                
+                if (
+                    total_batched_samples % args.gradient_accumulation_steps == 0
+                    or is_last_step_and_steps_less_than_grad_acc
+                ):
+                    
+                    for name, param in discriminator.named_parameters():
+                        if param.grad is not None:
+                            print(f"Grad: {name} - Shape: {param.grad.shape} - Memory: {param.grad.numel() * 4 / 1e6:.2f} MB")
+                    # Gradient clipping for discriminator
+                    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), self.args.max_grad_norm)
+
+                    for name, param in discriminator.named_parameters():
+                        if param.grad is not None:
+                            print(f"Grad: {name} - Shape: {param.grad.shape} - Memory: {param.grad.numel() * 4 / 1e6:.2f} MB")
+
                     self.d_optimizer.step()
+                    self.d_optimizer.zero_grad()
+                    self.discriminator.zero_grad()
 
                 ###################
                 # Train Generator #
@@ -751,11 +781,6 @@ class GANTrainer(Trainer):
                 # Update FLOPs for generator
                 self.current_flos += float(self.floating_point_ops(inputs))
 
-                # Check if it's the last step and handle gradient synchronization
-                is_last_step_and_steps_less_than_grad_acc = (
-                    steps_in_epoch <= args.gradient_accumulation_steps and (step + 1) == steps_in_epoch
-                )
-
                 if (
                     total_batched_samples % args.gradient_accumulation_steps == 0
                     or is_last_step_and_steps_less_than_grad_acc
@@ -782,6 +807,8 @@ class GANTrainer(Trainer):
                     self.optimizer.step() # TODO ensure this indentation is correct
                     model.zero_grad()
                     self.optimizer.zero_grad()
+
+                    torch.cuda.empty_cache()
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
@@ -870,16 +897,26 @@ class GANTrainer(Trainer):
     def get_disc_loss(self, discriminator, lang_tkns, img_tkns):
         "run the forward pass through the discriminator and get the loss, call backwards"
         discriminator.train()
-     
+
+        def log_memory_usage(stage):
+            print(f"[{stage}] Allocated: {torch.cuda.memory_allocated() / 1e6:.2f} MB")
+            print(f"[{stage}] Reserved: {torch.cuda.memory_reserved() / 1e6:.2f} MB")
+
+        log_memory_usage("Before Discriminator Forward")
         # calculate loss on real batch - forward pass through disc returns loss
         disc_loss = discriminator.forward(img_tkns, lang_tkns, d_mode=True) # d_mode here means we are not doing generator training step - using labels normally
 
         if self.args.n_gpu > 1:
             disc_loss = disc_loss.mean()
 
+        log_memory_usage("After Discriminator Forward")
+
         # call backwards on discriminator  
-        disc_loss.backward()
- 
+        with self.discriminator.no_sync(): 
+            disc_loss.backward(retain_graph=False)
+        
+        log_memory_usage("After Discriminator Backward")
+
         return disc_loss.detach() / self.args.gradient_accumulation_steps
 
     def get_gen_loss(self, discriminator, img_tkns) -> torch.Tensor:

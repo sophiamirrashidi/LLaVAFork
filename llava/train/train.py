@@ -41,6 +41,9 @@ from PIL import Image
 
 import torch.distributed as dist
 
+from torch.utils.checkpoint import checkpoint_sequential
+
+
 
 local_rank = None
 
