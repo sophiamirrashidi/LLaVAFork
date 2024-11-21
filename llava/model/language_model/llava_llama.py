@@ -68,7 +68,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     def get_model(self):
         return self.model
     
-
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -83,6 +82,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
+        d_mode: Optional[bool] = None
         ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         if inputs_embeds is None:
@@ -93,55 +93,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 past_key_values,
                 inputs_embeds,
                 labels,
-                lang_tkn_list, 
-                img_tkn_list
-            ) = self.prepare_inputs_labels_for_multimodal(
-                input_ids,
-                position_ids,
-                attention_mask,
-                past_key_values,
-                labels,
-                images,
-                image_sizes,
-            )
-
-        model_output = super().forward(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                labels=labels,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
-        
-        if isinstance(img_tkn_list, list):
-            assert len(img_tkn_list) == 1, 'img tokens is not a list of length 1'
-            img_tkn_list = img_tkn_list[0]
-        else:  
-            print(f'len_img_tkns: {len(img_tkn_list)}, \n img_tkns: img_tkns')
-
-        img_tkn_list = img_tkn_list.view(-1, 5120)
-        # img_tkn_list = img_tkn_list[:1000]
-
-        lang_tkn_list = torch.cat(lang_tkn_list, dim=0) # batching the language tokens
-        # lang_tkn_list = lang_tkn_list[:1000]  
-        model_output['lang_tkns'] = lang_tkn_list
-        model_output['img_tkns'] = img_tkn_list
-        
-        return model_output
-
-        if inputs_embeds is None:
-            (
-                input_ids,
-                position_ids,
-                attention_mask,
-                past_key_values,
-                inputs_embeds,
-                labels,
+                img_tkn_list, 
+                lang_tkn_list
             ) = self.prepare_inputs_labels_for_multimodal(
                 input_ids,
                 position_ids,
@@ -167,9 +120,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             )
 
         if d_mode == True:
-            discrim_dict = self.discriminator.run_forward(
-                self.disc_data, d_mode=True
-            )  # d loss is sum of disc loss on images and lang
+            d_loss = self.discriminator.forward(img_tkn_list, lang_tkn_list, d_mode=True)  # d loss is sum of disc loss on images and lang
             model_output = super().forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -183,15 +134,12 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 return_dict=return_dict,
             )
 
-            d_loss = discrim_dict["loss"]
-            wandb.log({"disc_loss: ": d_loss})
+            # wandb.log({"disc_loss: ": d_loss})
             model_output.loss = d_loss # returning only discriminator loss
 
             return model_output
         else:
-            d_loss = self.discriminator.run_forward(
-                self.disc_data, d_mode=False
-            )  # d loss is sum of disc loss on images and lang; same call in both if and else
+            d_loss = self.discriminator.run_forward(img_tkn_list, lang_tkn_list, d_mode=False)  # d loss is sum of disc loss on images and lang; same call in both if and else
             model_output = super().forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -205,10 +153,13 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 return_dict=return_dict,
             )
 
-            wandb.log({"model_loss": model_output.loss})
-            wandb.log({"generator_disc_loss": d_loss}) # generator on fake labels 
+            # wandb.log({"model_loss": model_output.loss})
+            model_output['model_loss'] = model_output.loss
+            model_output['fake_label_loss'] = d_loss
+            # wandb.log({"fake_label_loss": d_loss}) # generator on fake labels 
             model_output.loss = model_output.loss + d_loss
-            wandb.log({"summed_loss": model_output.loss})
+            # wandb.log({"summed_loss": model_output.loss})
+            model_output['summed_loss'] = model_output.loss
                 
         return model_output
 

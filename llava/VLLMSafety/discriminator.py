@@ -15,10 +15,20 @@ class Discriminator(nn.Module):
         x = torch.sigmoid(self.fc2(x))
         return x
  
-    def forward(self, img_tkns, lang_tkns, d_mode):
+    def forward(self, img_tkn_list, lang_tkn_list, d_mode):
         # TODO fix the device stuff
         device = 'cuda'  
         loss_function = nn.BCELoss()
+
+        if isinstance(img_tkn_list, list):
+            assert len(img_tkn_list) == 1, 'img tokens is not a list of length 1'
+            img_tkn_list = img_tkn_list[0]
+        else:  
+            print(f'len_img_tkns: {len(img_tkn_list)}, \n img_tkns: img_tkns')
+
+        img_tkns = img_tkn_list.view(-1, 5120)
+
+        lang_tkns = torch.cat(lang_tkn_list, dim=0) # batching the language tokens 
 
         if d_mode:
             img_pred = self.linear(img_tkns.detach())
