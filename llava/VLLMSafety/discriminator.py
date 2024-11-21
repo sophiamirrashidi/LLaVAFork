@@ -20,38 +20,36 @@ class Discriminator(nn.Module):
         device = 'cuda'  
         loss_function = nn.BCELoss()
 
-        assert len(img_tkns == 1), 'img tokens is not a list of length 1'
+        if isinstance(img_tkns, list):
+            assert len(img_tkns) == 1, 'img tokens is not a list of length 1'
+            img_tkns = img_tkns[0]
+        else:  
+            print(f'len_img_tkns: {len(img_tkns)}, \n img_tkns: img_tkns')
 
-        image_batch = img_tkns[0].view(-1, 5120).to(device)
-        img_tkns = image_batch.view(-1, 5120)  # flatten the lists
-        img_pred = self.linear(img_tkns)
+        img_tkns = img_tkns.view(-1, 5120).to(device)
 
         if d_mode:
-            img_label = torch.full((img_tkns.size(0), 1), 1, dtype=torch.bfloat16, device=device)  # use label 1 for imgs
+            img_pred = self.linear(img_tkns.detach())
+            img_label = torch.full((img_tkns.size(0), 1), 1, dtype=torch.bfloat16, device=device) # label 1 for images 
             img_loss = loss_function(img_pred, img_label)
-            
-            total_lang_loss = 0
+            img_correct_count = torch.eq(torch.ge(img_pred, 0.5).float(), img_label).sum().item()
+            img_accuracy = img_correct_count / img_tkns.size(0) * 100
 
-            for lang in lang_tkns:
-                lang_pred = self.linear(lang.view(-1, 5120))
-                lang_label = torch.full((lang_pred.size(0), 1), 0, dtype=torch.bfloat16, device=device)
+            lang_tkns = torch.cat(lang_tkns, dim=0) # batching the language tokens 
+            lang_pred = self.linear(lang_tkns.detach())
+            lang_label = torch.full((lang_pred.size(0), 1), 0, dtype=torch.bfloat16, device=device)
 
-                lang_loss = loss_function(lang_pred, lang_label)
-                total_lang_loss += lang_loss
-                
-            img_correct = torch.eq(torch.ge(img_pred, 0.5).float().to(torch.bfloat16), img_label).sum().item()
-            lang_correct = torch.eq(torch.ge(lang_pred, 0.5).float().to(torch.bfloat16), lang_label).sum().item()
-
-            img_accuracy = img_correct / img_tkns.size(0) * 100
-            lang_accuracy = lang_correct / lang_tkns.size(0) * 100
+            lang_loss = loss_function(lang_pred, lang_label)
+            lang_correct_count = torch.eq(torch.ge(lang_pred, 0.5).float(), lang_label).sum().item()
+            lang_accuracy = lang_correct_count / lang_pred.size(0) * 100
 
             print(f"Image Accuracy: {img_accuracy:.2f}%")
             print(f"Language Accuracy: {lang_accuracy:.2f}%")
 
             loss = img_loss + lang_loss
-
             return loss
         
         else:
+            img_pred = self.linear(img_tkns)
             img_with_lang_label_loss = loss_function(img_pred, torch.full((img_tkns.size(0), 1), 0, dtype=torch.bfloat16, device=device))
             return img_with_lang_label_loss

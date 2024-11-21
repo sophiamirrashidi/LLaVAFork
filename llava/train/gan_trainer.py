@@ -9,6 +9,8 @@ import deepspeed
 import sys 
 import json
 import numpy as np
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from typing import Dict, Optional, Union, List, Any, Tuple
 
@@ -180,14 +182,8 @@ class GANTrainer(Trainer):
     def __init__(self, *args, discriminator=None, **kwargs):
         super().__init__(*args, **kwargs) 
         
-        self.discriminator = discriminator
-        
-        if self.discriminator is not None:
-            self._setup_discriminator()
-    
-    def _setup_discriminator(self):
-        if self.args.place_model_on_device:
-            self._move_model_to_device(self.discriminator, self.args.device)
+        self.discriminator = discriminator.to(kwargs['args'].local_rank)
+        self.discriminator = DDP(discriminator, device_ids=[kwargs['args'].local_rank])
 
     def create_accelerator_and_postprocess(self):
         grad_acc_kwargs = {"num_steps": self.args.gradient_accumulation_steps}
@@ -202,13 +198,6 @@ class GANTrainer(Trainer):
             gradient_accumulation_plugin=gradient_accumulation_plugin,
         )
 
-        # THIS IS THE ONLY CHANGE TO THIS FUNCTION: ADDING AN ACCELERATOR FOR THE DISC
-        self.disc_accelerator = Accelerator(
-            dispatch_batches=self.args.dispatch_batches,
-            split_batches=self.args.split_batches,
-            deepspeed_plugin=self.args.deepspeed_plugin,
-            gradient_accumulation_plugin=gradient_accumulation_plugin,
-        )
         # some Trainer classes need to use `gather` instead of `gather_for_metrics`, thus we store a flag
         self.gather_function = self.accelerator.gather_for_metrics
 
@@ -525,9 +514,6 @@ class GANTrainer(Trainer):
                 model, self.optimizer, self.lr_scheduler = self.accelerator.prepare(
                     self.model, self.optimizer, self.lr_scheduler
                 )
-        # TODO ensure this works correctly with the accelerator
-        self.discriminator = self.disc_accelerator.prepare(self.discriminator)
-        self.d_optimizer = self.disc_accelerator.prepare(self.d_optimizer)
         
         for param in self.discriminator.parameters():
             if torch.any(torch.isnan(param.data)):
@@ -715,15 +701,14 @@ class GANTrainer(Trainer):
                 with self.accelerator.accumulate(model):
                     output, model_loss = self.training_step(model, inputs)
 
-                lang_tkn_list = output[lang_tkn_list]
-                img_tkn_list = output[img_tkn_list]
+                lang_tkn_list = output['lang_tkn_list']
+                img_tkn_list = output['img_tkn_list']
 
                 #######################
                 # Train Discriminator #
                 #######################
-                
-                with self.disc_accelerator.accumulate(self.discriminator):
-                    disc_tr_loss_step = self.disc_training_step(model, discriminator, lang_tkn_list, img_tkn_list)
+
+                disc_tr_loss_step = self.get_disc_loss(discriminator, lang_tkn_list, img_tkn_list)
 
                 if (
                     args.logging_nan_inf_filter
@@ -734,47 +719,15 @@ class GANTrainer(Trainer):
                     disc_loss += disc_loss / (1 + self.state.global_step - self._globalstep_last_logged)
                 else:
                     disc_loss += disc_tr_loss_step
-
-                # Update FLOPs for discriminator
-                self.current_flos += float(self.floating_point_ops(inputs))
-
-                # Check if it's the last step and handle gradient synchronization
-                is_last_step_and_steps_less_than_grad_acc = (
-                    steps_in_epoch <= args.gradient_accumulation_steps and (step + 1) == steps_in_epoch
-                )
-
-                if (
-                    total_batched_samples % args.gradient_accumulation_steps == 0
-                    or is_last_step_and_steps_less_than_grad_acc
-                ):
-                    # Enable gradient synchronization explicitly if this is the last step
-                    if is_last_step_and_steps_less_than_grad_acc:
-                        self.disc_accelerator.gradient_state._set_sync_gradients(True)
-
-                    # Gradient clipping for discriminator
-                    if args.max_grad_norm is not None and args.max_grad_norm > 0:
-                        if is_sagemaker_mp_enabled() and args.fp16:
-                            self.d_optimizer.clip_master_grads(args.max_grad_norm)
-                        elif self.use_apex:
-                            nn.utils.clip_grad_norm_(
-                                amp.master_params(self.d_optimizer),
-                                args.max_grad_norm,
-                            )
-                        else:
-                            self.disc_accelerator.clip_grad_norm_(
-                                discriminator.parameters(),
-                                args.max_grad_norm,
-                            )
             
-                    self.d_optimizer.step() # TODO ensure this indentation is correct
-                    discriminator.zero_grad()
                     self.d_optimizer.zero_grad()
+                    self.d_optimizer.step()
 
                 ###################
                 # Train Generator #
                 ###################
                         
-                gen_disc_loss = self.get_gen_loss(model, discriminator, img_tkn_list)
+                gen_disc_loss = self.get_gen_loss(discriminator, img_tkn_list)
                 gen_loss_step = model_loss + gen_disc_loss
 
                 if self.use_apex:
@@ -782,6 +735,8 @@ class GANTrainer(Trainer):
                         scaled_loss.backward()
                 else:
                     self.accelerator.backward(gen_loss_step)
+
+                gen_loss_step = gen_loss_step.detach() # detaching here for logging since training_step() no longer detaches the loss 
 
                 if (
                     args.logging_nan_inf_filter
@@ -923,19 +878,21 @@ class GANTrainer(Trainer):
             disc_loss = disc_loss.mean()
 
         # call backwards on discriminator  
-        self.disc_accelerator.backward(disc_loss)
+        disc_loss.backward()
  
-        return disc_loss.detach() / self.args.gradient_accumulation.steps
+        return disc_loss.detach() / self.args.gradient_accumulation_steps
 
-    def get_gen_loss(self, model: nn.Module, discriminator, img_tkns) -> torch.Tensor:
+    def get_gen_loss(self, discriminator, img_tkns) -> torch.Tensor:
         "run the disc forward pass to get the loss of the generator, call backwards"
 
-        gen_disc_loss = discriminator.forward(img_tkns, d_mode=False) # getting the loss with the mismatched
+        # pass in None for lang_tkns because we do not use them in this
+        gen_disc_loss = discriminator.forward(img_tkns, None,d_mode=False) # getting the loss with the mismatched labels
 
         if self.args.n_gpu > 1:
             gen_disc_loss = gen_disc_loss.mean()  # mean() to average on multi-gpu parallel training
         
-        return gen_disc_loss.detach() / self.args.gradient_accumulation_steps
+        # TODO not detaching here but make sure that the backwards pass from the model does not update the discriminator
+        return gen_disc_loss / self.args.gradient_accumulation_steps
     
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
         """
@@ -954,7 +911,7 @@ class GANTrainer(Trainer):
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
-        return output, loss.detach() / self.args.gradient_accumulation_steps
+        return output, loss / self.args.gradient_accumulation_steps
     
     def compute_loss(self, model, inputs, return_outputs=True):
         """

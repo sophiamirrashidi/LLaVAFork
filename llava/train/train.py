@@ -976,13 +976,25 @@ def train(attn_implementation=None):
     # model.to("cuda")
     model.to(torch.device(f'cuda:{local_rank}'))
 
-    discriminator = Discriminator(5120)
+    discriminator = Discriminator(input_size=5120).to(dtype=torch.bfloat16)
 
     for p in discriminator.parameters():
                 p.requires_grad = True
 
+    for name, param in model.named_parameters():
+        if "vision_tower" in name:
+            param.requires_grad = False  # Freeze the vision tower parameters
+        else:
+            param.requires_grad = True 
+
+    for name, param in model.get_model().named_parameters():
+        if "vision_tower" in name:
+            assert not param.requires_grad, f"Parameter {name} in vision_tower has requires_grad set to True"
+        else:
+            assert param.requires_grad, f"Parameter {name} outside vision_tower does not have requires_grad set to True"
+    
     for name, param in model.get_model().mm_projector.named_parameters():
-        assert param.requires_grad, f"Parameter {name} does not have requires_grad set to True" 
+        assert param.requires_grad, f"Parameter {name} does not have requires_grad set to True"
 
     trainer = GANTrainer(model=model,
                     tokenizer=tokenizer,

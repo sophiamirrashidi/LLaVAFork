@@ -148,6 +148,7 @@ class LlavaMetaForCausalLM(ABC):
     ):
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
+            raise ValueError('Missing images')
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
         assert images.ndim < 5, "image dimension exceeds 5 and this not implemented to handle that - remove extra preprocessing"
@@ -162,7 +163,7 @@ class LlavaMetaForCausalLM(ABC):
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
             raw_image_features = self.encode_images(concat_images)
-            image_feature_list.append(raw_image_features.detach())
+            image_feature_list.append(raw_image_features)
             image_features = raw_image_features
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
@@ -209,6 +210,7 @@ class LlavaMetaForCausalLM(ABC):
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
             image_features = self.encode_images(images)
+            image_feature_list.append(image_features)
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
@@ -243,7 +245,7 @@ class LlavaMetaForCausalLM(ABC):
             if num_images == 0:
                 cur_image_features = image_features[cur_image_idx]
                 cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
-                lang_tkn_list.append(cur_input_embeds_1.detach())
+                lang_tkn_list.append(cur_input_embeds_1)
                 cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
                 new_input_embeds.append(cur_input_embeds)
                 new_labels.append(labels[batch_idx])
@@ -263,7 +265,7 @@ class LlavaMetaForCausalLM(ABC):
             cur_new_input_embeds = []
             cur_new_labels = []
 
-            chunk_sizes = [split_sizes[0], image_features.size(1), split_sizes[1]] # used for filtering for the discriminator
+            lang_tkn_list.extend(tensor for tensor in cur_input_embeds_no_im[1:])
 
             for i in range(num_images + 1):
                 cur_new_input_embeds.append(cur_input_embeds_no_im[i])
@@ -281,12 +283,6 @@ class LlavaMetaForCausalLM(ABC):
 
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
-
-            split_embeddings = torch.split(new_input_embeds[0], chunk_sizes, dim=0)
-            lang_tkns = torch.cat((split_embeddings[0], split_embeddings[2]), 0)
-            # do we want to cut out the first bunch of tokens? 
-            lang_tkns = split_embeddings[2] # only the second to avoid adding the same tokens over and over 
-            lang_tkn_list.append(lang_tkns.detach())
 
         # Truncate sequences to max length as image embeddings can make the sequence longer
         tokenizer_model_max_length = getattr(self.config, 'tokenizer_model_max_length', None)
@@ -324,8 +320,6 @@ class LlavaMetaForCausalLM(ABC):
                     attention_mask[i, :cur_len] = True
                     position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
                 
-        assert torch.equal(new_input_embeds[0], new_input_embeds_padded[0]) == True, "padding changed the tensor in prepare_inputs_labels_for_multimodal, so tensor filtering will not work" 
-
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
 
         if _labels is None:
