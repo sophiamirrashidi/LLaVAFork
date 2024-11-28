@@ -57,7 +57,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         self.pretraining_tp = config.pretraining_tp
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.eval_mode = False
+        self.eval_mode = True
 
         self.discriminator = Discriminator(5120) # hard coding in sizes for now
 
@@ -139,7 +139,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
             return model_output
         else:
-            d_loss = self.discriminator.run_forward(img_tkn_list, lang_tkn_list, d_mode=False)  # d loss is sum of disc loss on images and lang; same call in both if and else
+            d_loss = self.discriminator.forward(img_tkn_list, lang_tkn_list, d_mode=False)  # d loss is sum of disc loss on images and lang; same call in both if and else
             model_output = super().forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,

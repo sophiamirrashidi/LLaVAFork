@@ -52,7 +52,7 @@ from typing import List, Optional, Union
 import wandb
 
 TRAINER_STATE_NAME = "trainer_state.json"
-lr = 0.001
+lr = 0.0001
 beta1 = 0.5
 
 #os.environ['WANDB_MODE'] = 'disabled'
@@ -334,8 +334,11 @@ class LLaVATrainer(Trainer):
             logs: Dict[str, float] = {}
 
             # all_gather + mean() to get average loss over all processes
-            for value in loss_dict.values:
-                value = self._nested_gather(value).mean().item()
+            for key, value in loss_dict.items():
+                if isinstance(value, torch.Tensor):
+                    # Aggregate and take the mean across devices
+                    value = self._nested_gather(value).mean().item()
+                    loss_dict[key] = value 
 
             # reset tr_loss to zero
             # tr_loss -= tr_loss
@@ -847,7 +850,7 @@ class LLaVATrainer(Trainer):
     
     def training_gen(self, model): 
         for name, param in model.named_parameters():
-            if "discriminator" in name: 
+            if "discriminator" in name or 'vision_tower' in name: 
                 param.requires_grad = False
             else:
                 param.requires_grad = True
@@ -866,7 +869,7 @@ class LLaVATrainer(Trainer):
 
         # get d loss
         self.training_disc(model)
-        d_loss, _ = self._compute_loss_for_discriminator(model, inputs)
+        d_loss = self._compute_loss_for_discriminator(model, inputs)
         loss_dict['d_loss'] = d_loss
 
         # discriminator backwards pass and optimize update
